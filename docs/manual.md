@@ -1,0 +1,643 @@
+# FUT.AE — manual completo
+
+> Manual detalhado de comandos, regras e ferramentas de dados. A visão geral do projeto está no [README](../README.md).
+
+Projeto independente para coletar e organizar dados de jogadores, clubes e ligas
+para o futuro bot de futebol. O banco local fica em `data/memi.sqlite`; arquivos
+brutos, fotos e credenciais não devem ser versionados.
+
+## Preparação
+
+Para a visão do jogo, ideias de mecânicas, comandos planejados e decisões
+pendentes, consulte o [guia de ideias do jogo](guia-ideias-jogo.md).
+
+No Windows, a partir desta pasta:
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+python -m src.db
+```
+
+No macOS/Linux:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+cp .env.example .env
+python -m src.db
+```
+
+O comando `src.db` cria o schema sem apagar dados existentes. Configure as
+credenciais apenas no `.env`; nunca as envie pelo chat nem as versione.
+
+## Bot Discord
+
+Preencha `DISCORD_BOT_TOKEN` no `.env` e habilite **Message Content Intent**
+em Discord Developer Portal → Bot → Privileged Gateway Intents. Inicie o bot
+com:
+
+```powershell
+python -m src.bot
+```
+
+O bot carrega os comandos de jogo e gerenciamento em `src/cogs/`. `..roll`
+oferece 10 rolagens por ciclo de 30 minutos, renovadas na hora cheia e na meia hora
+(horário de Brasília), e segue as faixas de raridade do
+[guia de implementação](guia-ideias-jogo.md). Upgrades, torre e crates podem
+aumentar os rolls. Duplicatas próprias dão uma bola (até 10), +1 overall efetivo e
+100 Memilets; acima do limite dão 500 Memilets. Duplicatas de terceiros oferecem de
+100 a 300 Memilets a quem rolou, após resgate no botão. Jogadores livres são
+reivindicados pelo botão: quem rolou tem 5 segundos de exclusividade (aumentável até
+15), quem tem wish no jogador pode ter segundos de proteção, as ofertas expiram em 5
+minutos e cada pessoa tem um claim por ciclo (renova junto com os rolls).
+Os claims são atômicos e cada jogador só pode ter um dono.
+
+Todo comando funciona com `..` ou com o atalho `..` (`..roll`, `..amistoso`, `..tu`). O
+roll também atende por `..obter` e `..rolls`. `/wish`, `/starwish`, `/scout`, `/vender` e
+`/proteger` também existem como comandos de barra, sugerindo o nome do jogador enquanto se
+digita (no `/vender` e no `/proteger`, só os seus). Eles são registrados quando o bot liga.
+
+Comandos oficiais do **FUT.AE** incluem `..futae`, `..left`, `..top [categoria]`, `..scout <nome>`, `..daily`, `..shop`, `..upgrade`, `..crates`,
+`..wish`, `..wishlist`/`..wl`, `..starwish`/`..sw`, `..vender`, `..proteger`, `..troca`, `..dar`, `..pacote`, `..personalizar`, `..time`,
+`..escalar`, `..tatica`, `..amistoso` e `..campeonato`. A economia diária
+usa cooldown de 24 horas; wishes e Star Wishes afetam a roleta e
+os claims conforme o guia. Times têm dez formações, três estilos e imagens de
+escalação PNG. As imagens locais opcionais devem ficar em
+`data/assets/brasfoot/`, pasta ignorada pelo Git. O motor simula 90 minutos sem
+substituições, com fórmula própria documentada no guia; campeonatos são todos
+contra todos, em sequência, seguidos de final entre os dois primeiros.
+
+### Coleta contínua de fotos
+
+O worker abaixo busca até 30 fotos por minuto no TheSportsDB e grava os arquivos
+em `data/photos/`, que o `..roll` usa automaticamente:
+
+```powershell
+$env:THESPORTSDB_API_KEY = "123"
+python -m src.photo_worker
+```
+
+O progresso fica em `data/photo_worker_checkpoint.json`. Se o processo for
+interrompido, a próxima execução continua depois do último lote sem repetir os
+jogadores já processados. Falhas temporárias de rede, HTTP ou SQLite fazem o
+worker aguardar e tentar o mesmo lote novamente automaticamente, com espera
+progressiva de 15 segundos até no máximo 5 minutos. O processo só encerra para
+erros de configuração ou entrada inválida. Para alterar a espera inicial:
+
+```powershell
+python -m src.photo_worker --retry-delay 30
+```
+
+Para testar somente um lote:
+
+```powershell
+python -m src.photo_worker --once
+```
+
+O uso da chave `123` deve respeitar os limites do TheSportsDB. O worker não
+envia as fotos pelo Discord: ele salva localmente e o bot as anexa somente
+quando aquele jogador for sorteado.
+
+### Imagens de ligas, técnicos, estádios, lendas e times
+
+Tutorial completo (para pessoas e para IA): [imagens-sportsdb.md](imagens-sportsdb.md).
+
+`src.sportsdb_images` busca no TheSportsDB o que o `photo_worker` não cobre. Cada
+imagem é salva com o ID do registro, igual às fotos dos jogadores
+(`data/photos/leagues/<id>.png`, `coaches/`, `stadiums/`, `players/`, `clubs/`), e o
+caminho fica gravado no banco:
+
+```powershell
+python -m src.sportsdb_images                          # tudo
+python -m src.sportsdb_images --tipos ligas,lendas      # só alguns tipos
+python -m src.sportsdb_images --limite 10               # teste rápido
+python -m src.sportsdb_images --retentar                # busca de novo quem falhou
+```
+
+- **ligas**: lista as ligas de futebol de cada país e compara pelo nome e pelos nomes
+  alternativos (a liga "Premier League" acha a "English Premier League");
+- **técnicos**: busca pelo nome e prefere o registro com posição Manager/Coach;
+- **estádios**: tenta o nome e o nome oficial ("Estádio do …"), ignorando
+  "Estádio/Stadium/do" na comparação;
+- **lendas**: jogadores `Lenda`/`Lenda de Clube` sem foto, pelo nome, pelos apelidos do
+  arquivo das lendas e sem o sufixo de apelido ("Ronaldo Fenômeno" → "Ronaldo"),
+  conferindo a nacionalidade;
+- **times**: lista os times de cada liga encontrada. Time que já existe no bot (mesmo
+  nome, ignorando FC/SC e acentos, ou um nome alternativo) só ganha o escudo se não
+  tiver; time novo é criado com o escudo e passa a valer como emblema. Rodar de novo
+  não duplica nada.
+
+O script respeita ~30 consultas por minuto. Quem não é encontrado fica em
+`image_attempts` e não é buscado de novo sem `--retentar`. Com a chave gratuita `123`,
+o TheSportsDB corta as listas (5 ligas por país, 10 times por liga) e devolve poucas
+respostas por busca de jogador. Por isso as ligas são casadas com o índice
+`src/seeds/sportsdb_ligas.json` (todas as ligas de futebol, montado por
+`python -m scripts.indexar_ligas_sportsdb`) e os times são buscados pelo ID da liga,
+que traz a lista inteira. Só é aceita resposta com o nome exato (sem acentos): na
+dúvida entre homônimos, o script não baixa nada.
+
+Para testar manualmente, complete um time com `..time`, `..tatica` e
+`..escalar <id>` (o ID aparece em `..elenco`), depois use
+`..amistoso @pessoa`. Os campeonatos (Pontos Corridos e Copa IOS) jogam sozinhos às
+19:00 de Brasília, com todos do servidor que têm o time completo. Para ligar num
+servidor, configure o canal com `..campeonato canal [#canal]` e ative com
+`..campeonato ativar`. `MEMI_CHAMPIONSHIP_SCHEDULER=0` desliga o agendador em todos. Alguém com Gerenciar servidor pode
+começar a edição e jogar os jogos do dia na hora com `..campeonato jogar`.
+
+O schema v11 adiciona economia, wishes, times, escalações, trocas e campeonatos
+sem apagar os dados anteriores. Contas novas começam com saldo zero.
+
+## Bandeja do Windows
+
+Para executar em segundo plano, com menu para abrir a pasta, consultar logs,
+reiniciar e desligar:
+
+```powershell
+python -m pip install -r requirements-tray.txt
+python futae_tray.py
+```
+
+Para iniciar automaticamente com o Windows:
+
+```powershell
+python futae_tray.py --instalar
+```
+
+O token é lido de `DISCORD_BOT_TOKEN` no `.env` ou de `token.txt` nesta pasta.
+Esses arquivos são locais e estão protegidos pelo `.gitignore`.
+
+A demissão exige confirmação por botão. Uma troca só é concluída quando a
+oferta do primeiro lado e a aceitação do segundo lado estão registradas.
+Os comandos `..admin testeamistoso` e `..admin testecampeonato <quantidade>`
+são exclusivos do proprietário configurado em `MEMI_OWNER_ID` e servem para
+testar a simulação sem alterar times reais.
+
+## Changelog
+
+Este é o bot independente do jogo FUT.AE. O prefixo continua sendo `..` e
+`..futae` mostra apenas os comandos do jogo.
+
+### 3.3 — V2: loja, crates, Centro de Treinamento e cosméticos
+
+- **Bônus da conta** (`src/perks.py`): uma só função, `load_perks`, soma loja,
+  torre, prêmios permanentes de crates (`user_bonuses`) e cosméticos equipados, e dá
+  capacidade de rolls, slots de wish/Star Wish, cooldown e teto do daily, proteção
+  de wish, preço da crate, renda e bilheteria. Nada disso altera a chance da roleta.
+- **Loja V2** (`..upgrade`): 10 upgrades com limite, ícone redondo de cor própria e
+  confirmação antes da compra. A redução do preço da crate não é vendida: só sai em
+  crate. Migração única (versão 13 do schema): o `daily` antigo (+100 no teto) virou
+  `daily_max`, o bônus de duplicata foi removido e níveis acima dos limites novos
+  foram devolvidos em Memilets.
+- **Crates V2** (`open_crate`): sempre um item Básico (1–3 rolls instantâneos, que
+  valem só no ciclo atual, ou 150–300 Memilets) e, com chance baixa, um item de outra
+  raridade: Incomum 10%, Raro 3,5%, Épico 1,2%, Lendário 0,4%. A caixa vem toda em
+  itens ou toda em Memilets. Cosméticos nunca repetem o que a pessoa já tem; 5% das
+  caixas com item trazem um segundo item da mesma raridade.
+- **Cosméticos** (`src/cosmetics.py`, tabela `user_cosmetics`): emblema, uniforme,
+  estádio, técnico, liga e mascote. Só dá para equipar o que se possui; cada um
+  equipado (menos o estádio) soma +100 ao teto do daily. Itens que já estavam
+  equipados antes da regra viram posse da pessoa na inicialização. Clubes e logos
+  aparecem juntos como **emblemas**. Uniformes de `camisas2`/`camisas3` ganham
+  "(Uniforme 2/3)" no nome.
+- **Centro de Treinamento** (`src/tower.py`): 12 andares em qualquer ordem, 1000
+  Memilets o primeiro e +500 a cada andar construído. Completar os 12 libera uma
+  construção nova, que repete os efeitos. `..destruir` devolve tudo, inclusive
+  retirando as bolas do andar 12.
+- **Renda e bilheteria** (`src/income.py`): renda do primeiro amistoso do dia em casa
+  com estádio (100 + 50 por gol, ±100 por vitória/derrota, zero se perder por 3+ sem
+  marcar), com intervalo fixo de 24 h. Andar 5: cada jogo do campeonato guarda 50 (100
+  na vitória) até o limite. O campeão do dia recebe 500 Memilets.
+- **Lendas dos 12 grandes** (`src/seeds/lendas_brasileiras.json`,
+  `seed_club_legends`): 132 nomes; quem já existe como lenda da Enciclopédia (mesmo
+  nome ou apelido e mesmo país) não é duplicado, aposentados já no banco viram a carta,
+  e homônimos ganham o clube no nome, como "Pepe (Santos)". Overall de 83 a 89 com
+  `overall_source = 'Lenda de Clube'`.
+- **Emojis** (`src/icons.py`, `scripts/gerar_icones.py`): moeda Memilets (gato de
+  óculos) e ícones dos upgrades em `assets/emojis/futae/`, enviados como emojis da
+  aplicação pelo MeMi BOT.
+- **Escalação**: emblema embaixo à esquerda e técnico embaixo à direita.
+
+### 3.2 — enciclopédia, cartas e roleta maior
+
+- **Enciclopédia** (`src/encyclopedia.py`, dados em `src/seeds/enciclopedia.json`):
+  carregada a cada inicialização, sem duplicar. As lendas viram cartas com
+  `overall_source = 'Lenda'` (90–99, com os maiores nomes até 99). Se o jogador já
+  existe no banco com o mesmo nome e nacionalidade, ele é promovido em vez de
+  duplicado. Nomes de uma palavra só ("Marcos", "Juan") só promovem jogadores com
+  nota 80 ou mais; abaixo disso a lenda ganha carta própria, chamada "Nome (Lenda)".
+  Carga manual: `python -m src.encyclopedia`.
+- **Roleta** (`POOL_SQL` em `src/ratings.py`): entra todo jogador que não está
+  marcado como inativo e tem posição. Atividade `unknown` e a marca de fase 2 deixaram
+  de excluir. Quem não tem overall usa nota bruta 40 (60 no jogo). Sem posição
+  continua fora. `scripts/gerar_tabela_fora_roleta.py` usa a mesma regra.
+- **Horários**: rolls renovam a cada hora cheia, e mensagens mostram horário de
+  Brasília (`src/clock.py`, UTC−3 fixo, sem depender de `tzdata`).
+- **Cartas** (`src/card_image.py`): carta vertical usada em `..elenco` (uma por
+  página), `..scout` e `..roll`.
+- **Nomes em vez de IDs** (`src.game.resolve_player`): ordem de busca é ID, nome
+  exato, apelido contido no nome e iniciais. Com homônimos, abre um menu.
+- **Logos**: `sync_club_logos` liga escudos e logos do Cartola aos clubes e cria
+  os que faltam. Os nomes são padronizados com acentos dos clubes brasileiros.
+
+### 3.1 — escalação clicável, jogos narrados e overall novo
+
+- **Overall do jogo** (`src/ratings.py`): o banco guarda a nota da fonte e o jogo usa
+  uma escala valorizada, `nota + (90 − nota) × 0,4` abaixo de 90 (45 → 63, 60 → 72,
+  75 → 81). Jogadores Cartola valem 90 e a carta especial (`SPECIAL_PLAYER_NAMES`) é a única carta 100; ninguém mais
+  passa de 99, nem com bolas. A conta é feita por funções SQLite registradas em
+  `connect()`, então reimportações não precisam de migração.
+- **Séries de raridade**: Base, Comum, Incomum, Raro, Épico, Lendário, Ícone,
+  Galáctico e Única (só a carta 100, com peso próprio no roll). `..left` mostra
+  livres/total por série, além de Cartola, uniformes e logos.
+- **Escalação**: `..escalar` sem argumentos abre um montador com menu de formação,
+  menu de posição e menu de jogador filtrado pela posição e ordenado por overall, mais
+  o botão **Escalar automático**. A imagem é desenhada por formação, com fotos.
+- **Partidas**: o motor simula minuto a minuto (chances, gols, defesas, trave,
+  cartões, intervalo, acréscimos) e a narração edita o embed lance a lance. Ajuste a
+  velocidade com `MEMI_NARRATION_DELAY` (segundos, padrão 1,6). Final empatada vai para
+  os pênaltis, cobrança a cobrança.
+- **Economia**: crates com retorno mínimo de 350 Memilets, jackpot, reset de claim e
+  garantia de prêmio permanente a cada 50; `..carteira` em embed; novo `..tu`.
+- **Scout**: foto do jogador e busca em técnicos, estádios, clubes, ligas, uniformes,
+  emblemas, logos e mascotes. Fotos já baixadas em `data/photos/` são ligadas ao banco
+  na inicialização.
+- **Duplicados**: `python -m src.dedupe` lista e `--apply` remove; o proprietário também
+  pode usar `..admin duplicados`. Mantém o de maior overall e transfere posse, bolas,
+  wishes e fontes. Grupos com donos diferentes não são alterados.
+
+### Coleção e rolagens
+
+- Banco local com jogadores, ligas, clubes, técnicos, estádios e fontes de dados.
+- `..roll` com ciclos de 1 hora, raridades, claims, exclusividade temporária,
+  duplicatas, bolas e recompensas.
+- Jogadores sem clube aparecem como `Passes Livres`.
+- Fotos locais são opcionais, têm fallback visual e são coletadas pelo worker do
+  TheSportsDB sem enviar os arquivos ao Discord.
+- A carta especial (`SPECIAL_PLAYER_NAMES` em `src/ratings.py`) tem overall 100; Messi e Cristiano Ronaldo ficam
+  com overall 99.
+
+### Pesquisa e catálogo
+
+- `..scout <nome>` substitui `..im` e mostra apenas nome, overall e posição.
+- Em nomes repetidos, o resultado informa série, overall, posição e ID para seleção
+  inequívoca.
+- IDs continuam disponíveis para wishes, elenco e trocas, mas não são a única forma
+  de localizar um jogador.
+- `..top` possui páginas e categorias de jogadores, técnicos, uniformes, mascotes,
+  estádios, ligas, Cartola e emblemas.
+- Jogadores são ordenados por overall; os demais itens são ordenados alfabeticamente.
+- `TOP CARTOLA` reúne jogadores Cartola e os demais itens da série.
+
+### Economia e coleção pessoal
+
+- `..daily` paga de 400 a 1.200 Memilets (mais os bônus) e libera de novo 24 horas
+  depois, menos as reduções de upgrades, torre e crates (mínimo de 8 horas).
+- `..wishlist` e `..wl` mostram a lista completa de wishes em embed.
+- `..starwish` e `..sw` identificam Star Wishes com o emoji `⭐`.
+- `..upgrade` tem 13 upgrades com limite (rolls, wishes, Star Wish, daily, proteção
+  de wish, teto do daily, exclusividade, valor de venda, `..rt`, bilheteria, renda e o
+  **Contrato Relâmpago**: até 20% de chance de a contratação não gastar o claim do ciclo;
+  **Banco de Rolls**: até 15 rolls que sobraram ontem viram rolls ativos no primeiro roll do dia),
+  sempre com confirmação. O Seguro de Contrato (+10% de venda por nível) custa 5 mil + 5 mil
+  por nível.
+- `..crates`, `..construir`, `..destruir`, `..renda`, `..bilheteria` e
+  `..cosmeticos` (com `..emblema`, `..uniforme`, `..estadio`, `..tecnico`,
+  `..liga` e `..mascote`) completam a economia do clube.
+- `..vender base|comum|…`, `..vender abaixo 70` e `..vender posicao ZAG` vendem todos
+  os reservas do filtro de uma vez (sem titulares nem 🔒), com o total antes.
+- `..proteger <nome>` liga/desliga o 🔒: o jogador some de todas as vendas.
+- `..crates 5|10` abre várias caixas; os rolls da caixa ficam guardados (não expiram) e
+  só valem depois de `..ativar <quantidade>` (ex.: `..ativar 20`). Ativados, entram depois dos rolls do ciclo, e
+  cada 10 ativados dão **+1 contratação extra** (usada quando o claim do ciclo já foi). A
+  sobra conta para a próxima.
+- Garantias das caixas: 15 caixas seguidas sem Raro (ou melhor) e a próxima traz um Raro;
+  50 sem Épico (ou melhor) e a próxima traz um Épico; 200 sem Lendário e a próxima traz um
+  Lendário. Os três contadores aparecem no `..crates` e no resultado de cada abertura.
+- As caixas também dão caixas e pacotes: Raro dá +1 caixa ou pacote de jogador; Épico, caixa
+  épica ou pacote de jogador; Lendário, pacote épico. Eles vão para o `..inventario` (ou
+  `..inv`, `..mochila`), que tem um botão **Abrir** por item, com a animação de sempre e
+  sem cobrar. Os cosméticos ficam no `..cosmeticos`.
+- `..construir` mostra a torre com um menu para escolher o andar a construir e o botão de
+  destruir; os dois pedem confirmação, como `..construir <1-12>` e `..destruir`.
+- `..pacote` dá uma carta livre do mercado (nunca Base); carta de pacote vende na hora
+  por 50% e fica 1 hora sem poder ser doada ou trocada.
+- `..shop` (ou `..loja`) mostra tudo o que dá para comprar, com botões: caixas, pacotes,
+  upgrades, torre e all-in. A **caixa épica** (`..crates epica [1|5|10]`, 8× a caixa) é a
+  caixa comum sem a chance de vir só o básico: o item extra sempre vem, nas mesmas
+  proporções da comum; o **pacote épico** (`..pacote epico`, 35.000) só traz Raro ou melhor, com 5% de Ícone e 1% de Galáctico, e a carta vende pelo valor cheio (sem o corte de 50% do pacote comum).
+- `..allin` é uma aposta de 75.000: uma roleta de 20 fatias gira em GIF e, quando para,
+  vira a carta. 2 fatias douradas dão Ícone ou melhor (1 em 10); as outras, uma carta como
+  a do pacote comum. Sem Ícone livre no mercado, não gira e não cobra.
+- `..topi` mostra o top dos jogadores em cartas (◀ ▶ e lista).
+- `..semfoto [meus]` mostra os jogadores sem foto, do maior overall para o menor, um
+  por vez: **📷 Enviar foto** salva a imagem (já vira a foto da carta) e passa para o
+  próximo. A primeira foto de um jogador sem foto é livre para todos; trocar ou apagar
+  continua só com o dono ou a moderação. As cartas do `..elenco` e do `..topi` têm o
+  botão **🖼️ Fotos**, e a galeria do `..img` tem **📷 Adicionar**.
+- `..stats [@pessoa]` mostra jogos, V/E/D, aproveitamento, gols, maior vitória, forma,
+  artilheiros e títulos, com filtros por tipo (campeonato/amistoso), período e rival.
+  Amistosos passam a ser guardados (`friendly_matches`) a partir desta versão.
+- `..img <jogador>` abre a galeria de imagens do jogador (cada página é a carta com
+  aquela imagem); com uma imagem ou GIF anexado, cadastra uma nova, sempre cortada no
+  formato da foto da carta. ⭐ deixa a imagem como principal (GIF vira carta animada).
+  Só o dono do jogador ou a moderação adiciona, troca a principal ou apaga.
+- A torre não sorteia de novo a bola do andar 12: destruir tira a bola, e reconstruir
+  devolve ao mesmo jogador. O andar 12 exige os 11 titulares.
+- `..personalizar` (ou o botão no `..time`) muda nome, cor, escudo e cosméticos com
+  prévia do cartão do clube; o escudo é enviado no próprio formulário.
+- `..vender` (alias `..demitir`) mostra o valor de venda, o saldo depois e o que muda
+  no time antes de confirmar; sem nome, abre um menu para vender vários reservas.
+- `..troca @pessoa` abre um montador com os dois elencos (até 5 jogadores por lado e
+  Memilets); a outra pessoa aceita ou recusa, e quem propôs pode cancelar.
+- `..dar @pessoa <jogador|valor>` doa um jogador ou Memilets, com confirmação.
+- `..pay @pessoa <quantia>` (ou `..pagar`, `..pix`) manda Memilets, com confirmação.
+- Mercado entre pessoas: `..anunciar <jogador> <preço>` põe uma carta à venda (ela fica no
+  elenco até alguém comprar; até 10 anúncios, valem 3 dias; protegidos e cartas na trava
+  do pacote não entram). `..mercado` lista os anúncios (mais novos, mais baratos,
+  melhores) com menu de compra; `..anuncios` mostra os seus e cancela. Na compra, a carta
+  sai do time de quem vendeu e quem vende recebe o preço menos 5% de taxa. Se a carta sair
+  do elenco de outro jeito, o anúncio some.
+- No roll, um jogador livre que renderia mais que o seu titular numa vaga (ou que preenche
+  uma vaga vazia) vem com o aviso "⬆️ Melhor que o seu titular de CA (Fulano · 78 → 87)".
+  Contratando, ele já entra no time nessa vaga (quem sai perde capitão, falta e pênalti).
+- `..tu` e `..carteira` têm atalhos (Rolar, Daily, Missões, Ativar rolls, Inventário); o
+  roll tem **Rolar de novo**; o daily mostra as missões e resgata as prontas; os botões de
+  compra ficam cinza dizendo quanto falta; `..ajuda <comando>` explica cada comando.
+
+### Times e partidas
+
+- `..time`, `..escalar` e `..tatica` gerenciam time, escalação, formação e estilo.
+  O `..tatica` abre um painel com menus de formação (com "trocar e reescalar" quando a
+  escalação não cabe), estilo, capitão e cobradores, e a imagem do time.
+- `..vender` sem nome abre o painel de venda: filtros de raridade e posição,
+  "Selecionar todos" (mesmo mais de 25), incluir titulares, proteger com 🔒 e ver os
+  protegidos, com a cotação ao vivo. `..proteger` sem nome abre nos protegidos.
+- `..amistoso` simula partidas de 90 minutos com força por setores, xG, gols,
+  artilheiros e estilos táticos. `..amistoso @pessoa idaevolta` joga ida (na casa de quem
+  desafiou) e volta (na casa do outro): vale o placar somado e o empate no agregado vai para
+  os pênaltis no fim da volta. A renda, se escolhida, é só a do jogo de ida.
+- Apostas entre duas pessoas: `..amistoso @pessoa [idaevolta] aposta 1000` e
+  `..penaltis @pessoa 1000`. O outro aceita, cada um entra com o valor (ou ninguém, se
+  faltar saldo) e quem vence leva o pote. Amistoso apostado não gera renda; se a partida
+  não acontecer, as apostas voltam.
+- `..cassino [valor]` (`apostar`, `bet`, `casino`) abre o cassino: um painel com a
+  aposta (½, ×2 ou valor digitado, de 100 a 100.000) e quatro jogos **justos** (retorno
+  médio de exatamente 100%, a casa não fica com nada), cada um com animação em GIF:
+  - **Cara ou coroa**: acertou, 2x.
+  - **Caça-níquel**: três rolos (cereja, limão, sino, estrela, diamante, sete); três iguais
+    pagam de 4x a 250x e dois iguais pagam ~1,24x (o valor que fecha a conta em 100%).
+  - **Roleta**: 36 números sem o zero; cor ou par/ímpar 2x, dúzia 3x, número 36x.
+  - **Minas**: grade 4×4 com 1, 3, 5 ou 8 bombas; cada casa segura multiplica o prêmio
+    pela chance exata de ter passado e dá para sacar a qualquer hora. Se o jogo ficar
+    aberto, ele saca sozinho o que já foi ganho.
+- `..desafio` (`pve`, `lendas`) abre os desafios contra times lendários, montados na hora
+  com as lendas da enciclopédia (12 clubes brasileiros, seleções lendárias e a Seleção
+  Mundial), cada um na formação em que rende mais, com o melhor jogador de capitão. As
+  lendas jogam pelo overall; os chefões têm um bônus de força de +1% (multiplica ataque,
+  defesa, meio e goleiro na simulação), sem mudar o overall. Contra lendas não tem pênaltis:
+  **só a vitória conta**. No placar, clubes e seleções usam o escudo real, buscado no
+  TheSportsDB pelo nome exato (clube conferido como brasileiro) e guardado em
+  `data/photos/lendas_clubes/` e `data/photos/selecoes/` (sem `THESPORTSDB_API_KEY`, usa a
+  chave pública de teste `123`); a Seleção Mundial tem um escudo próprio (globo dourado).
+  Sem escudo encontrado, fica o escudo gerado:
+  - **Escada**: 28 degraus do mais fácil (times do mercado, força ~62) à Seleção Mundial
+    (~97); vencer libera o próximo e paga 400 + 200 por degrau (só na primeira vez), com
+    uma caixa a cada 5 degraus.
+  - **Chefão do dia**: um time lendário com +1% de força, 1 tentativa; 3.000 + caixa épica.
+  - **Chefão da semana**: uma seleção lendária (ou a Mundial) com +1% de força, 3
+    tentativas; 12.000 + pacote épico.
+  - **Campanhas** (300 por vitória): *Lendas do Brasileirão* (os 12 clubes, 15.000 + pacote
+    épico no fim), *Copa das Lendas* (oitavas à final contra seleções; perdeu, recomeça;
+    25.000 + pacote épico) e *Rumo ao Mundial* (as 5 seleções mais fortes e a Seleção
+    Mundial; 40.000 + 2 pacotes épicos).
+  - **Conquistas**: 9 metas únicas com prêmio (primeira lenda, chefões, escada completa,
+    cada campanha, vencer a Seleção Mundial), no botão Conquistas.
+  - **Desafio livre**: qualquer time lendário; prêmio na primeira vitória do dia contra
+    cada um.
+- `..comparar @pessoa` (`vs`, `versus`) põe os dois times lado a lado: imagem com as duas
+  escalações, tabela de força, ataque, defesa, meio, goleiro e elenco (▲ em quem é melhor),
+  melhor jogador, valor do elenco, forma dos últimos 5 jogos, confronto direto e o
+  prognóstico (a partida simulada 500 vezes, com quem pediu em casa).
+- `..penaltis @pessoa` é uma disputa de pênaltis interativa: quem bate escolhe o canto e
+  quem defende escolhe onde pular, em segredo. Acertar o canto defende 75% das vezes; errar
+  ainda pode dar trave (6%). 5 cobranças para cada lado, morte súbita no empate, e quem
+  demora mais de 60 s tem o canto sorteado.
+- `..campeonato`: Pontos Corridos e depois a Copa IOS, jogados em edições. Entram sozinhos
+  todos do servidor com o time completo (11 titulares), até 16: primeiro quem ficou de fora
+  na edição anterior, depois por ordem de criação do time. Todo dia às 19:00 (Brasília) o
+  bot narra lance a lance todos os jogos do dia e depois mostra os resultados, a tabela e
+  a agenda de amanhã.
+  - **Pontos Corridos**: pontos corridos só de ida, uma rodada por dia (com 16 times, 15
+    rodadas); os 2 primeiros fazem a final no dia seguinte, e o 1º tem o mando. Desempate:
+    pontos, vitórias, saldo e gols marcados.
+  - **Copa IOS**: começa no dia seguinte à final do Pontos Corridos, uma fase por dia (oitavas,
+    quartas, semi e final com 16 times). O campeão e o vice do Pontos Corridos ficam em lados opostos
+    da chave e só podem se cruzar na final; o resto é sorteado. Com menos de 16 times, os
+    mais bem colocados no Pontos Corridos passam direto na primeira fase. Empate vai para os pênaltis.
+  - Sem escalação válida no dia do jogo: derrota por W.O. (3 × 0).
+  - Prêmios do Pontos Corridos: campeão 15.000 + caixa épica + pacote épico, vice 8.000 + caixa
+    épica, 3º 5.000, 4º 3.000, os demais 1.000, e todos +150 por vitória. Copa: campeão
+    8.000 + caixa épica, vice 4.000, semifinalistas 2.000, quartas 1.000.
+  - Cada competição paga os prêmios quando termina. Depois da final da Copa, a próxima
+    edição começa no dia seguinte, às 19:00 (com 16 times, uma edição dura 20 dias).
+  - Subcomandos: `tabela` (também `..tabela`), `agenda [@pessoa]`, `copa`, `historico`
+    (também `..campeoes`).
+  - Para admins do bot e quem tem Gerenciar servidor:
+    - `canal [#canal]` e `ativar`: onde e se os jogos acontecem;
+    - `jogar`: começa a edição (se estiver esperando) e joga os jogos de hoje na hora;
+    - `adiantar`: joga já a próxima rodada ou fase da Copa e adianta o calendário em um dia;
+    - `pausar` / `retomar`: para os jogos diários; ao retomar, o calendário anda os dias
+      parados (não acumula jogos);
+    - `horario 21:00`: muda o horário dos jogos do servidor (Brasília; padrão 19h). Se o bot
+      estava desligado no horário, os jogos saem quando ele voltar, no mesmo dia;
+    - `status`: agendador, canal, horário, pausa, dia da edição, jogos pendentes e times que
+      perderiam por W.O.;
+    - `remover @pessoa`: tira um time da edição; os jogos que faltam dele viram W.O.;
+    - `cancelar confirmar`: encerra a edição sem prêmios e abre a próxima.
+  - `..pontos`: a tabela com o seu próximo jogo; `..pontos rodada N` mostra os jogos de
+    qualquer rodada (sem número, a última jogada). Admins: `adiantar` (joga já a próxima
+    rodada), `encerrar confirmar` (as rodadas que faltam somem, a tabela fica como está e a
+    final dos 2 primeiros vai para o próximo dia de jogos) e `refazer @pessoa` (refaz o jogo de
+    hoje da pessoa; final não).
+  - `..copa`: a chave com o seu próximo jogo. Admins: `adiantar` (joga já a próxima fase),
+    `sortear` (novo sorteio, só antes da primeira fase), `wo @pessoa` (W.O. no próximo jogo da
+    pessoa; o adversário passa) e `refazer @pessoa` (refaz o jogo de hoje, se a fase seguinte
+    ainda não foi jogada; o vencedor novo entra na vaga dela).
+  - O antigo campeonato diário e a temporada mensal saíram; os jogos deles continuam
+    contando no `..stats` e nas rivalidades.
+- `..grupo`: **grupo de clubes**, para quem tem várias contas. Cada conta segue com o seu
+  clube (jogam entre si e no campeonato normalmente); o dono gerencia todas pela Principal.
+  - `criar <nome>`, `convidar @conta` (a conta só entra com `..grupo aceitar`; `recusar`),
+    `sair`, `remover @conta`, `ordem @a @b @c`, `nome <nome>`, `desfazer confirmar`.
+  - `..grupo`: painel com as contas na ordem (XI, formação, elenco, Memilets), os
+    "reforços parados" (quem está numa conta e seria titular numa conta acima) e os botões
+    Otimizar, Escalar todas e Vender (escolhe a conta e abre o painel de venda dela).
+  - `otimizar`: junta os jogadores do grupo, monta o melhor XI da Principal na formação dela,
+    com o que sobra o da Secundária, e assim por diante (o mesmo cálculo do `..escalar`
+    automático). Mostra o plano antes; só muda de conta quem vira titular.
+  - `mover <jogador> <conta>` (a conta é `@conta`, `1`, `2`, `principal`, `secundaria`…; se
+    ele for melhor que um titular, já entra no time), `escalar` (refaz a escalação de todas) e
+    `elenco [posição]` (os melhores do grupo, com a conta de cada um).
+  - `vender <conta>` abre o painel de venda da conta; `vender [conta] abaixo 70|base|posicao
+    ZAG` é a venda em massa em todas as contas (ou na citada), sem quem seria titular em outra.
+  - Trava: mover e otimizar param 15 min antes do horário do campeonato quando alguma conta
+    do grupo joga no dia, e voltam depois dos jogos. Carta de pacote travada não sai da conta;
+    jogador 🔒 pode mudar de conta (continua protegido).
+  - Ao contratar no roll, o bot avisa se o jogador seria titular em outra conta do grupo.
+- `..admin` (só admins: o dono em `MEMI_OWNER_ID` e quem estiver em `MEMI_ADMIN_IDS`, separado por
+  vírgula):
+  - `dar @pessoa 5000` / `tirar @pessoa 5000`: Memilets (o saldo não fica negativo);
+  - `item @pessoa caixa_epica 2`: itens do inventário (número negativo tira);
+  - `jogador @pessoa <nome ou ID> [forçar]`: entrega um jogador; com `forçar`, tira de quem
+    já tem (e do time dele);
+  - `resetar @pessoa rolls|claim|tudo`: devolve os rolls do ciclo e/ou libera o claim;
+  - `status`: versão (commit) rodando, tempo ligado, ping, tamanho do banco e último backup;
+  - `backup`: cópia comprimida do banco agora, em `data/backups/` (guarda as 10 últimas);
+  - `testeamistoso`, `testecampeonato <quantidade>`, `testeimagem` e `duplicados`.
+
+### Operação e segurança
+
+- Schema v11 com migrações idempotentes e preservação dos dados existentes.
+- O SQLite aguarda locks temporários para permitir o bot e o worker de fotos operarem
+  juntos sem falha imediata.
+- Fotos, bancos, credenciais e assets locais ficam fora do Git.
+- A suíte automatizada cobre banco, importadores, rolagens, economia, transações,
+  partidas, campeonatos e registro dos comandos.
+
+Execute os testes do projeto com:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+## Transfermarkt
+
+Baixe `players.csv.gz` e `clubs.csv.gz` para `data/raw/` a partir dos links
+públicos do [Transfermarkt Datasets](https://github.com/dcaribou/transfermarkt-datasets/wiki).
+Confira as categorias de posição antes de importar:
+
+```powershell
+python -m src.import_tm --show-positions
+python -m src.import_tm --limit 100
+```
+
+Sem `--limit`, a importação processa o arquivo completo. Os clubes são carregados
+mesmo quando os jogadores estão limitados. Uma nova execução atualiza os mesmos
+registros Transfermarkt em vez de duplicá-los. Subposições não reconhecidas
+interrompem a importação. Quando falta subposição, usa-se posição geral apenas
+como fallback (Defender→ZAG, Midfield→MC, Attack→CA, Goalkeeper→GOL); esses
+registros são marcados para revisão. Categorias Missing não recebem inferência.
+
+## EA FC
+
+Coloque os CSVs do EA FC em `data/raw/`. Prefira a edição mais recente disponível
+(atualmente FC27) e confira a data do snapshot; FC24/25/26 podem ter elencos e
+notas desatualizados. Primeiro inspecione as posições disponíveis:
+
+```powershell
+python -m src.import_ea --show-positions
+python -m src.import_ea --limit 100
+python -m src.import_ea --input "C:\caminho\FC27_20260912.csv" --dry-run
+```
+
+Ou informe arquivos explicitamente com um ou mais `--input caminho.csv`. O
+importador entende os formatos EA/Sofifa, inclusive o formato FC27, e valida
+posições principais e alternativas antes de gravar. Posições desconhecidas
+impedem a importação até serem revisadas. Em posições múltiplas ordenadas, usa a
+primeira como posição principal. O EA FC fornece apenas overall e posição:
+o clube Transfermarkt não é sobrescrito. O importador cruza por nome e data de
+nascimento; sem data, usa nome, nacionalidade e idade do snapshot. Ambíguos e
+casos sem dados suficientes vão para `data/review/ea_matches.csv`, sem inserção
+como novos. Jogadores só do EA podem entrar como novos, exceto os de clubes ou
+ligas brasileiras. Futebol feminino é excluído por padrão; use `--include-women`
+somente se quiser incluí-lo. A edição mais recente prevalece.
+`--dry-run` executa numa cópia temporária do banco, informa cruzamentos,
+ambiguidade, novos jogadores, exclusões brasileiras e correlação entre o
+overall EA e a estimativa de mercado. O banco original permanece somente leitura;
+no ensaio, aliases de nome só são considerados com data de nascimento igual.
+Aliases únicos fortes podem casar; candidatos fracos ou múltiplos são enviados
+para revisão e não entram como novos. O relatório mostra os casamentos por alias,
+os 30 maiores overalls que permaneceriam como novos e o CSV de revisão da
+simulação em `data/review/ea_matches_dry_run.csv`. A importação normal não usa
+casamento por alias.
+
+## Cruzamento e overall
+
+```powershell
+python -m src.match
+python -m src.overall --limit 100
+```
+
+O cruzamento exige nome compatível e data de nascimento igual; clube não é
+critério de correspondência, pois os elencos EA podem estar desatualizados.
+Candidatos acima de 75/100 são gravados como `pending` em
+`player_match_candidates` e exportados para `data/review/player_matches.csv`;
+nenhum merge é aplicado automaticamente.
+
+O overall preserva as notas EA FC, salvo ajuste manual explícito. Os demais
+jogadores recebem estimativa logarítmica pelo valor de mercado (€5 mil → 30;
+€100 milhões → 88). Clube e liga não alteram a estimativa. Ajustes manuais ficam
+em `overall_adjustments`.
+
+## API-Football
+
+Preencha `API_FOOTBALL_KEY` em `.env`. Antes de qualquer carga completa, teste
+uma combinação de liga e temporada autorizada no seu plano:
+
+```powershell
+python -m src.api_football --league ID_DA_LIGA --season ANO --limit 1
+```
+
+O cliente exige o cabeçalho de saldo em cada resposta, persiste a cota diária
+observada em `import_checkpoints` e interrompe a coleta ao chegar a zero.
+Importa páginas de 20 jogadores e salva página/offset para retomar. Repita o
+mesmo comando no dia seguinte para continuar do ponto salvo; a carga pode ser
+limitada com `--limit` durante testes.
+
+Na temporada 2026/27, o Transfermarkt considera ativo quem tem `last_season`
+2025 ou posterior; clube não participa da regra. O clube continua opcional para
+exibição e pode ficar vazio se não houver correspondência em `clubs.csv.gz`.
+Registros sem o corte de temporada ficam com atividade `unknown`; não são automaticamente
+marcados como inativos. A API-Football pode continuar fornecendo confirmação
+adicional, mas não é necessária para popular o pool. Jogadores sem overall
+continuam fora do pool. Esse status é uma heurística: o aviso do dataset
+Transfermarkt informa que os dados vão até 6 de julho de 2026 e não cobrem
+elencos de 2026/27, portanto não comprova participação atual em campo.
+
+O repositório dos dados informa licença CC0 1.0 para o dataset. Isso não
+estabelece licença para as imagens hospedadas por Transfermarkt; não baixe nem
+reutilize imagens de `image_url` sem confirmar os direitos separadamente.
+
+## Fotos e relatório
+
+```powershell
+python -m src.photos --limit 100
+python -m src.photos --limit 100 --thesportsdb
+python -m src.report
+```
+
+O coletor baixa URLs já fornecidas pelas fontes; `--thesportsdb` habilita a
+busca por nome exato para imagens ausentes e requer `THESPORTSDB_API_KEY` no
+`.env`. Respostas 404 e imagens ausentes são ignoradas; erros de rede ou HTTP
+inesperados são mostrados. O relatório resume fontes, posições, faixas de overall, jogadores sem posição,
+marcados para revisão, notas 87+, atividade conhecida/desconhecida, elegíveis
+para roleta, tops 30 por overall e valor de mercado, clubes sem jogadores,
+cruzamentos confirmados e pendentes e jogadores sem foto.
+
+O repositório Transfermarkt declara CC0 1.0 para o dataset, mas isso não concede
+por si só direitos sobre as imagens externas apontadas em `image_url`; não
+baixe nem reutilize essas imagens sem confirmar licença ou autorização própria.
+
+## Fontes planejadas
+
+1. Transfermarkt Datasets (CSV compactado), fonte de clube e valor de mercado.
+2. Dataset EA FC mais recente disponível (atualmente FC27), baixado
+   manualmente; fonte exclusiva para overall e posição.
+3. API-Football, respeitando a cota diária informada pela API.
+4. TheSportsDB para fotos, escudos e estádios.
+
+Consulte [`projeto.md`](projeto.md) para regras, etapas e comandos.

@@ -1,0 +1,596 @@
+"""Rolagens, duplicatas e claims atômicos do jogo."""
+
+from __future__ import annotations
+
+import random
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+from src.clock import BRASILIA
+from src.db import DATABASE_PATH, connect
+from src.missions import record
+from src.pool_cache import snapshot
+from src.perks import (
+    BASE_EXCLUSIVE_SECONDS,
+    ROLLS_PER_CYCLE,
+    load_perks,
+)
+from src.ratings import GAME_OVERALL_SQL, RARITY_TIERS, effective_overall
+
+CYCLE_LENGTH = timedelta(minutes=30)
+# Os ciclos começam na hora cheia e na meia hora (em Brasília também, já que o fuso é UTC-3).
+CYCLE_OFFSET_SECONDS = 0
+CLAIM_EXCLUSIVE_TIME = timedelta(seconds=BASE_EXCLUSIVE_SECONDS)
+CLAIM_OFFER_LIFETIME = timedelta(minutes=5)
+MAX_DUPLICATE_BALLS = 10
+
+RARITY_BANDS = tuple((lower, upper, weight) for _, _, lower, upper, weight in RARITY_TIERS)
+
+
+class RollError(Exception):
+    """Erro de regra da roleta que pode ser exibido ao jogador."""
+
+
+class NoEligiblePlayers(RollError):
+    """O banco não possui jogadores elegíveis para a roleta."""
+
+
+class RollLimitReached(RollError):
+    """A conta já usou os rolls do ciclo atual."""
+
+    def __init__(self, reset_at: datetime, capacity: int = ROLLS_PER_CYCLE):
+        self.reset_at = reset_at
+        self.capacity = capacity
+        super().__init__("Os rolls deste ciclo acabaram.")
+
+
+@dataclass(frozen=True)
+class RollOutcome:
+    player: dict[str, Any]
+    kind: str
+    rolls_remaining: int
+    cycle_resets_at: datetime
+    offer_id: int | None = None
+    reward_amount: int | None = None
+    balls: int | None = None
+    effective_overall: int | None = None
+    exclusive_seconds: int = BASE_EXCLUSIVE_SECONDS
+    wished_by: tuple[str, ...] = ()
+    protection_seconds: int = 0
+    banked: int = 0  # Banco de Rolls: rolls de ontem que viraram ativos agora
+
+
+@dataclass(frozen=True)
+class ClaimOutcome:
+    status: str
+    reward_amount: int | None = None
+    retry_at: datetime | None = None
+    protected_until: datetime | None = None
+    free_claim: bool = False  # Contrato Relâmpago: não gastou o claim do ciclo
+
+
+def _utc_now(value: datetime | None) -> datetime:
+    now = value or datetime.now(timezone.utc)
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now deve incluir um fuso horário.")
+    return now.astimezone(timezone.utc)
+
+
+def _cycle_start(now: datetime) -> datetime:
+    epoch_seconds = int(now.timestamp())
+    cycle_index = (epoch_seconds - CYCLE_OFFSET_SECONDS) // int(CYCLE_LENGTH.total_seconds())
+    return datetime.fromtimestamp(
+        cycle_index * int(CYCLE_LENGTH.total_seconds()) + CYCLE_OFFSET_SECONDS,
+        tz=timezone.utc,
+    )
+
+
+cycle_start_for = _cycle_start
+
+
+def _create_offer(
+    connection: sqlite3.Connection,
+    player_id: int,
+    roller_id: str,
+    offer_type: str,
+    reward_amount: int | None,
+    now: datetime,
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO claim_offers (
+            player_id, roller_id, offer_type, reward_amount, created_at, expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            player_id,
+            roller_id,
+            offer_type,
+            reward_amount,
+            now.isoformat(timespec="seconds"),
+            (now + CLAIM_OFFER_LIFETIME).isoformat(timespec="seconds"),
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def roll_player(
+    discord_user_id: int | str,
+    display_name: str,
+    database_path: str | Path = DATABASE_PATH,
+    *,
+    now: datetime | None = None,
+    rng: random.Random | random.SystemRandom | None = None,
+) -> RollOutcome:
+    """Consome um roll do ciclo e sorteia um jogador ativo elegível."""
+    current_time = _utc_now(now)
+    generator = rng or random.SystemRandom()
+    user_id = str(discord_user_id)
+    cycle_start = _cycle_start(current_time)
+    cycle_end = cycle_start + CYCLE_LENGTH
+    cycle_key = cycle_start.isoformat(timespec="seconds")
+    reset_at = cycle_end
+
+    with connect(database_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            INSERT INTO game_users (discord_user_id, display_name)
+            VALUES (?, ?)
+            ON CONFLICT(discord_user_id) DO UPDATE SET
+                display_name = excluded.display_name,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (user_id, display_name),
+        )
+        usage = connection.execute(
+            """
+            SELECT rolls_used
+            FROM roll_cycles
+            WHERE discord_user_id = ? AND cycle_started_at = ?
+            """,
+            (user_id, cycle_key),
+        ).fetchone()
+        rolls_used = int(usage["rolls_used"]) if usage else 0
+        banked = _credit_roll_bank(connection, user_id, current_time)
+        # Rolls guardados só valem depois de ativados (`..ativar`): esses são os ativos.
+        roll_tokens = int(
+            connection.execute(
+                "SELECT active_rolls FROM game_users WHERE discord_user_id = ?", (user_id,)
+            ).fetchone()["active_rolls"]
+        )
+        perks = load_perks(connection, user_id)
+        roll_capacity = perks.roll_capacity + cycle_bonus_rolls(connection, user_id, cycle_key)
+        exclusive_seconds = perks.exclusive_seconds
+        use_roll_token = rolls_used >= roll_capacity
+        if use_roll_token and roll_tokens == 0:
+            raise RollLimitReached(reset_at, roll_capacity)
+
+        # Faixas do mercado vindas do índice em memória (`src.pool_cache`): sem varrer
+        # a tabela inteira com a função de overall a cada roll.
+        pool = snapshot(connection, database_path)
+        available_counts = {band: len(ids) for band, ids in pool.bands.items() if ids}
+        available_bands = sorted(available_counts)
+        if not available_bands:
+            raise NoEligiblePlayers("Não há jogadores elegíveis no pool.")
+
+        selected_band = generator.choices(
+            available_bands,
+            weights=[RARITY_BANDS[index][2] for index in available_bands],
+            k=1,
+        )[0]
+        band_ids = pool.bands[selected_band]
+        band_set = set(band_ids)
+        star_wish_ids = [
+            int(row["player_id"])
+            for row in connection.execute(
+                "SELECT player_id FROM user_wishes WHERE discord_user_id = ? "
+                "AND wish_type = 'star' ORDER BY player_id",
+                (user_id,),
+            )
+            if int(row["player_id"]) in band_set
+        ]
+        candidate_count = available_counts[selected_band]
+        if star_wish_ids and generator.random() < (1.25 * len(star_wish_ids)) / (
+            candidate_count + 0.25 * len(star_wish_ids)
+        ):
+            selected_player_id = generator.choice(star_wish_ids)
+            player_row = connection.execute(
+                f"""
+                SELECT p.id, p.name, p.display_name, p.club_name, p.nationality,
+                       p.game_position, {GAME_OVERALL_SQL} AS overall, p.overall_source,
+                       p.overall_edition, p.photo_path,
+                       o.discord_user_id AS owner_id,
+                       owner.display_name AS owner_name,
+                       COALESCE(b.balls, 0) AS balls
+                FROM players AS p
+                LEFT JOIN player_ownership AS o ON o.player_id = p.id
+                LEFT JOIN game_users AS owner ON owner.discord_user_id = o.discord_user_id
+                LEFT JOIN player_balls AS b ON b.player_id = p.id
+                WHERE p.id = ?
+                """,
+                (selected_player_id,),
+            ).fetchone()
+        else:
+            # Mesma escolha de antes: ids da faixa em ordem, sem as Star Wishes, e um
+            # deslocamento sorteado; só que a lista vem do índice em vez de uma varredura.
+            excluded = set(star_wish_ids)
+            candidates = [player_id for player_id in band_ids if player_id not in excluded]
+            offset = generator.randrange(candidate_count - len(star_wish_ids))
+            player_row = connection.execute(
+                f"""
+            SELECT p.id, p.name, p.display_name, p.club_name, p.nationality,
+                   p.game_position, {GAME_OVERALL_SQL} AS overall, p.overall_source,
+                   p.overall_edition, p.photo_path,
+                   o.discord_user_id AS owner_id,
+                   owner.display_name AS owner_name,
+                   COALESCE(b.balls, 0) AS balls
+            FROM players AS p
+            LEFT JOIN player_ownership AS o ON o.player_id = p.id
+            LEFT JOIN game_users AS owner ON owner.discord_user_id = o.discord_user_id
+            LEFT JOIN player_balls AS b ON b.player_id = p.id
+            WHERE p.id = ?
+            """,
+                (candidates[offset],),
+            ).fetchone()
+        if player_row is None:
+            raise NoEligiblePlayers("Não há jogadores elegíveis nessa faixa.")
+        player = dict(player_row)
+
+        connection.execute(
+            """
+            INSERT INTO roll_cycles (discord_user_id, cycle_started_at, rolls_used)
+            VALUES (?, ?, 1)
+            ON CONFLICT(discord_user_id, cycle_started_at)
+            DO UPDATE SET rolls_used = rolls_used + 1
+            """,
+            (user_id, cycle_key),
+        )
+
+        record(connection, user_id, "roll", now=current_time)
+        if use_roll_token:
+            connection.execute(
+                "UPDATE game_users SET active_rolls = active_rolls - 1 WHERE discord_user_id = ?",
+                (user_id,),
+            )
+            roll_tokens -= 1
+        rolls_remaining = max(0, roll_capacity - rolls_used - 1) + roll_tokens
+        offer_id = None
+        reward_amount = None
+        balls = None
+        effective = effective_overall(player["overall"], player["balls"])
+        wished_by: tuple[str, ...] = ()
+        protection_seconds = 0
+        if player["owner_id"] == user_id:
+            balls = int(player["balls"])
+            if balls < MAX_DUPLICATE_BALLS:
+                # Andar 2 da torre: chance de a bola vir em dobro.
+                gained = 2 if generator.random() < perks.double_ball_chance else 1
+                gained = min(gained, MAX_DUPLICATE_BALLS - balls)
+                balls += gained
+                reward_amount = 100
+                connection.execute(
+                    """
+                    INSERT INTO player_balls (player_id, balls)
+                    VALUES (?, ?)
+                    ON CONFLICT(player_id) DO UPDATE SET
+                        balls = player_balls.balls + excluded.balls,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (player["id"], gained),
+                )
+                effective = effective_overall(player["overall"], balls)
+                kind = "own_duplicate_ball" if gained == 1 else "own_duplicate_double_ball"
+            else:
+                reward_amount = 500
+                effective = effective_overall(player["overall"], balls)
+                kind = "own_duplicate_max_balls"
+            connection.execute(
+                """
+                UPDATE game_users
+                SET memilets = memilets + ?, updated_at = CURRENT_TIMESTAMP
+                WHERE discord_user_id = ?
+                """,
+                (reward_amount, user_id),
+            )
+        elif player["owner_id"] is not None:
+            reward_amount = generator.randint(100, 300)
+            offer_id = _create_offer(
+                connection,
+                int(player["id"]),
+                user_id,
+                "duplicate_reward",
+                reward_amount,
+                current_time,
+            )
+            kind = "other_duplicate"
+        else:
+            offer_id = _create_offer(
+                connection,
+                int(player["id"]),
+                user_id,
+                "player_claim",
+                None,
+                current_time,
+            )
+            kind = "unowned"
+            wished_by, protection_seconds = _wish_protection(connection, int(player["id"]), user_id)
+
+        return RollOutcome(
+            player=player,
+            kind=kind,
+            rolls_remaining=rolls_remaining,
+            cycle_resets_at=reset_at,
+            offer_id=offer_id,
+            reward_amount=reward_amount,
+            balls=balls,
+            effective_overall=effective,
+            exclusive_seconds=exclusive_seconds,
+            wished_by=wished_by,
+            protection_seconds=protection_seconds,
+            banked=banked,
+        )
+
+
+def _credit_roll_bank(connection: sqlite3.Connection, user_id: str, now: datetime) -> int:
+    """Banco de Rolls: no primeiro roll do dia, rolls que sobraram ontem viram ativos.
+
+    Conta os rolls do ciclo não usados nos ciclos de ontem (horário de Brasília) e credita
+    até o limite do upgrade. Quem comprou agora começa a contar a partir de hoje."""
+    cap = load_perks(connection, user_id).roll_bank_cap
+    local = now.astimezone(BRASILIA)
+    today = local.date().isoformat()
+    row = connection.execute(
+        "SELECT roll_bank_day FROM game_users WHERE discord_user_id = ?", (user_id,)
+    ).fetchone()
+    last = row["roll_bank_day"] if row else None
+    if last == today:
+        return 0
+    connection.execute(
+        "UPDATE game_users SET roll_bank_day = ? WHERE discord_user_id = ?", (today, user_id)
+    )
+    if not cap or last is None:
+        return 0
+    start = (local - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+    used = connection.execute(
+        "SELECT COALESCE(SUM(rolls_used), 0) FROM roll_cycles WHERE discord_user_id = ? "
+        "AND cycle_started_at >= ? AND cycle_started_at < ?",
+        (
+            user_id,
+            start.astimezone(timezone.utc).isoformat(timespec="seconds"),
+            end.astimezone(timezone.utc).isoformat(timespec="seconds"),
+        ),
+    ).fetchone()[0]
+    cycles = int(timedelta(days=1) / CYCLE_LENGTH)
+    unused = max(0, load_perks(connection, user_id).roll_capacity * cycles - int(used))
+    banked = min(cap, unused)
+    if banked:
+        connection.execute(
+            "UPDATE game_users SET active_rolls = active_rolls + ? WHERE discord_user_id = ?",
+            (banked, user_id),
+        )
+    return banked
+
+
+def claimed_at(value: str) -> datetime:
+    """Horário salvo do último claim, sempre em UTC (registros antigos vêm sem fuso)."""
+    moment = datetime.fromisoformat(value)
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
+def cycle_bonus_rolls(connection: sqlite3.Connection, user_id: str, cycle_key: str) -> int:
+    """Rolls instantâneos das crates: valem só no ciclo em que foram ganhos."""
+    row = connection.execute(
+        """
+        SELECT amount FROM cycle_bonus_rolls
+        WHERE discord_user_id = ? AND cycle_started_at = ?
+        """,
+        (user_id, cycle_key),
+    ).fetchone()
+    return int(row["amount"]) if row else 0
+
+
+def _wish_protection(
+    connection: sqlite3.Connection, player_id: int, roller_id: str
+) -> tuple[tuple[str, ...], int]:
+    """Quem tem wish no jogador (fora quem rolou) e a maior proteção entre eles."""
+    wishers = tuple(
+        str(row["discord_user_id"])
+        for row in connection.execute(
+            """
+            SELECT discord_user_id FROM user_wishes
+            WHERE player_id = ? AND discord_user_id != ?
+            ORDER BY wish_type DESC, created_at
+            """,
+            (player_id, roller_id),
+        )
+    )
+    protection = max(
+        (load_perks(connection, wisher).wish_protection_seconds for wisher in wishers),
+        default=0,
+    )
+    return wishers, protection
+
+
+def open_claim_offers(
+    offer_ids, database_path: str | Path = DATABASE_PATH, *, now: datetime | None = None
+) -> set[int]:
+    """Das ofertas de contratação dadas, as que ainda dá para reivindicar agora."""
+    ids = [int(offer_id) for offer_id in offer_ids]
+    if not ids:
+        return set()
+    current_time = _utc_now(now).isoformat(timespec="seconds")
+    marks = ", ".join("?" * len(ids))
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT o.id FROM claim_offers AS o
+            LEFT JOIN player_ownership AS po ON po.player_id = o.player_id
+            WHERE o.id IN ({marks}) AND o.offer_type = 'player_claim'
+              AND o.status = 'pending' AND o.expires_at > ? AND po.player_id IS NULL
+            """,
+            (*ids, current_time),
+        ).fetchall()
+    return {int(row["id"]) for row in rows}
+
+
+def claim_roll_offer(
+    offer_id: int,
+    discord_user_id: int | str,
+    database_path: str | Path = DATABASE_PATH,
+    *,
+    now: datetime | None = None,
+    rng: random.Random | random.SystemRandom | None = None,
+) -> ClaimOutcome:
+    """Resgata a moeda ou atribui o jogador em uma transação atômica."""
+    current_time = _utc_now(now)
+    user_id = str(discord_user_id)
+    generator = rng or random.SystemRandom()
+    with connect(database_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        offer = connection.execute(
+            """
+            SELECT id, player_id, roller_id, offer_type, reward_amount, status,
+                   created_at, expires_at
+            FROM claim_offers
+            WHERE id = ?
+            """,
+            (offer_id,),
+        ).fetchone()
+        if offer is None:
+            return ClaimOutcome("not_found")
+        if offer["status"] != "pending":
+            return ClaimOutcome("already_claimed")
+
+        expires_at = datetime.fromisoformat(offer["expires_at"])
+        if current_time >= expires_at:
+            connection.execute(
+                "UPDATE claim_offers SET status = 'expired' WHERE id = ?",
+                (offer_id,),
+            )
+            return ClaimOutcome("expired")
+
+        if offer["offer_type"] == "duplicate_reward":
+            if user_id != offer["roller_id"]:
+                return ClaimOutcome("not_roller")
+            reward_amount = int(offer["reward_amount"])
+            connection.execute(
+                """
+                UPDATE game_users
+                SET memilets = memilets + ?, updated_at = CURRENT_TIMESTAMP
+                WHERE discord_user_id = ?
+                """,
+                (reward_amount, user_id),
+            )
+            connection.execute(
+                """
+                UPDATE claim_offers
+                SET status = 'claimed', claimed_by = ?, claimed_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (user_id, current_time.isoformat(timespec="seconds"), offer_id),
+            )
+            return ClaimOutcome("reward_claimed", reward_amount=reward_amount)
+
+        created_at = datetime.fromisoformat(offer["created_at"])
+        has_wish = connection.execute(
+            """
+            SELECT 1 FROM user_wishes
+            WHERE discord_user_id = ? AND player_id = ?
+            """,
+            (user_id, offer["player_id"]),
+        ).fetchone()
+        # Proteção de wish: por alguns segundos só quem tem wish no jogador pode contratar.
+        # Vários donos de wish podem pegar; um ignora a proteção do outro.
+        _, protection = _wish_protection(connection, int(offer["player_id"]), offer["roller_id"])
+        protected_until = created_at + timedelta(seconds=protection)
+        if protection and not has_wish and current_time < protected_until:
+            return ClaimOutcome("wish_protected", protected_until=protected_until)
+        if user_id != offer["roller_id"]:
+            exclusive_seconds = load_perks(connection, offer["roller_id"]).exclusive_seconds
+            exclusivity_end = created_at + timedelta(seconds=exclusive_seconds)
+            if not has_wish and current_time < exclusivity_end:
+                return ClaimOutcome("exclusive")
+
+        account = connection.execute(
+            "SELECT last_claim_at, bonus_claims FROM game_users WHERE discord_user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if account is None:
+            raise LookupError("A conta de jogo ainda não foi cadastrada.")
+        claimer_perks = load_perks(connection, user_id)
+        # Um claim por ciclo: o claim renova junto com os rolls (hora cheia e meia hora).
+        # Com o do ciclo já usado, gasta uma contratação extra (dos rolls ativados), se houver.
+        cycle_start = _cycle_start(current_time)
+        use_bonus = bool(
+            account["last_claim_at"] and claimed_at(account["last_claim_at"]) >= cycle_start
+        )
+        if use_bonus and not account["bonus_claims"]:
+            return ClaimOutcome("cooldown", retry_at=cycle_start + CYCLE_LENGTH)
+
+        owner = connection.execute(
+            "SELECT discord_user_id FROM player_ownership WHERE player_id = ?",
+            (offer["player_id"],),
+        ).fetchone()
+        if owner is not None:
+            connection.execute(
+                "UPDATE claim_offers SET status = 'unavailable' WHERE id = ?",
+                (offer_id,),
+            )
+            return ClaimOutcome("unavailable")
+
+        connection.execute(
+            "INSERT INTO player_ownership (player_id, discord_user_id) VALUES (?, ?)",
+            (offer["player_id"], user_id),
+        )
+        # Contrato Relâmpago: com sorte, a contratação não gasta nada (nem o claim do
+        # ciclo, nem uma contratação extra).
+        chance = claimer_perks.free_claim_chance
+        free_claim = bool(chance) and generator.random() < chance
+        if free_claim:
+            pass
+        elif use_bonus:
+            connection.execute(
+                "UPDATE game_users SET bonus_claims = bonus_claims - 1, "
+                "updated_at = CURRENT_TIMESTAMP WHERE discord_user_id = ?",
+                (user_id,),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE game_users SET last_claim_at = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE discord_user_id = ?
+                """,
+                (current_time.isoformat(timespec="seconds"), user_id),
+            )
+        connection.execute(
+            """
+            UPDATE claim_offers
+            SET status = 'claimed', claimed_by = ?, claimed_at = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (user_id, current_time.isoformat(timespec="seconds"), offer_id),
+        )
+        overall = connection.execute(
+            f"SELECT {GAME_OVERALL_SQL} AS overall FROM players AS p WHERE p.id = ?",
+            (offer["player_id"],),
+        ).fetchone()["overall"]
+        record(connection, user_id, "claim", now=current_time)
+        if int(overall or 0) >= 85:
+            record(connection, user_id, "claim_85", now=current_time)
+        # Andar 3 da torre: Memilets iguais ao overall de quem foi contratado.
+        reward = None
+        if claimer_perks.floor(3):
+            reward = int(overall or 0) * claimer_perks.floor(3)
+            if reward:
+                connection.execute(
+                    "UPDATE game_users SET memilets = memilets + ? WHERE discord_user_id = ?",
+                    (reward, user_id),
+                )
+        return ClaimOutcome("player_claimed", reward_amount=reward or None, free_claim=free_claim)

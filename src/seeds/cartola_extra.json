@@ -1,0 +1,11 @@
+{
+ "description": "Jogadores extras da categoria Cartola (cartas personalizadas do servidor). Os nomes abaixo são fictícios, só de exemplo: troque pelos do seu grupo. As cartas usam overall 90, exceto a carta especial (veja SPECIAL_PLAYER_NAMES em src/ratings.py), que usa 100. A foto é opcional e fica em data/assets/cartola/cards/.",
+ "players": [
+  {"name": "Artilheiro Exemplo", "position": "CA", "club": "Passes Livres", "overall": 90},
+  {"name": "Camisa Dez", "position": "CA", "club": "Várzea United", "overall": 90},
+  {"name": "Volante Raiz", "position": "CA", "club": "Esporte Clube Exemplo", "overall": 90},
+  {"name": "Goleiro Paredão", "position": "CA", "club": "Passes Livres", "overall": 90},
+  {"name": "Lateral Foguete", "position": "CA", "club": "Real Pelada", "overall": 90},
+  {"name": "Craque Secreto", "position": "CA", "club": "Atlético Exemplo", "overall": 100}
+ ]
+}

@@ -1,0 +1,1281 @@
+"""Comandos do Pontos Corridos e da Copa IOS (`src.league`) e os jogos diários.
+
+Todo dia no horário do servidor (19h de Brasília, se ninguém mudou com
+`..campeonato horario`), nos servidores com o campeonato ativado, o bot começa a edição
+(se for o dia) e joga tudo o que está marcado até hoje, cada jogo narrado lance a lance:
+primeiro as rodadas e a final do Pontos Corridos, depois as fases da Copa. No fim vêm o quadro do
+dia, a tabela ou a chave atualizada e a agenda; nas finais, o pôster do campeão.
+
+`..campeonato` abre um painel com botões (Resumo, Tabela, Agenda, Copa, Campeões) que
+troca a página na mesma mensagem. As imagens ficam em `src.league_images`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+from datetime import date, datetime, timedelta
+
+import discord
+from discord.ext import commands, tasks
+
+from src import league
+from src.admins import is_admin
+from src.boards_image import render_league_table
+from src.clock import BRASILIA
+from src.cogs.matches import score_file
+from src.commentary import rivalry_intro, rivalry_line
+from src.db import DATABASE_PATH, connect
+from src.income import venue_name
+from src.league_images import (
+    GOLD,
+    GREEN,
+    render_bracket,
+    render_champion,
+    render_edition_start,
+    render_matchday,
+)
+from src.narration import narrate
+from src.simulation import penalty_events
+from src.team_stats import rivalry
+from src.teams import get_team
+
+LOGGER = logging.getLogger("memi.league")
+DEFAULT_TIME = "19:00"
+GOLD_COLOR = discord.Color.from_rgb(*GOLD)
+GREEN_COLOR = discord.Color.from_rgb(*GREEN)
+INTRO = (
+    "Dois campeonatos, um depois do outro, com os mesmos times:\n"
+    "⚽ **Pontos Corridos**: todos contra todos, só ida, uma rodada por dia. Os 2 primeiros "
+    "fazem a final.\n"
+    "🏆 **Copa IOS**: logo depois, mata-mata com uma fase por dia. Campeão e vice do Pontos Corridos "
+    "em lados opostos da chave; empate vai para os pênaltis.\n"
+    "Entram sozinhos todos com o time completo (11 titulares), até 16. Jogos às **{hour}**."
+)
+Page = tuple[discord.Embed, list[discord.File]]
+
+
+def _now() -> datetime:
+    """Agora em Brasília (separado para os testes poderem trocar o relógio)."""
+    return datetime.now(BRASILIA)
+
+
+def hour_label(value: str | None) -> str:
+    """ "19:00" vira "19h"; "20:30" vira "20h30"."""
+    hour, minute = (value or DEFAULT_TIME).split(":")
+    return f"{int(hour)}h" + (minute if minute != "00" else "")
+
+
+def parse_time(text: str) -> str | None:
+    """Horário digitado ("21", "21h", "21:30", "21h30") em "HH:MM", ou None se não der."""
+    cleaned = text.strip().lower().replace("h", ":").rstrip(":")
+    hour, _, minute = cleaned.partition(":")
+    if not hour.isdigit() or (minute and not minute.isdigit()):
+        return None
+    hour_value, minute_value = int(hour), int(minute or 0)
+    if not (0 <= hour_value <= 23 and 0 <= minute_value <= 59):
+        return None
+    return f"{hour_value:02d}:{minute_value:02d}"
+
+
+def _date(edition: dict, day: int) -> date:
+    return date.fromisoformat(edition["start_date"]) + timedelta(days=day - 1)
+
+
+def _day_label(edition: dict, day: int) -> str:
+    """Data do dia `day` da edição ("qui, 05/11")."""
+    weekdays = ("seg", "ter", "qua", "qui", "sex", "sáb", "dom")
+    moment = _date(edition, day)
+    return f"{weekdays[moment.weekday()]}, {moment:%d/%m}"
+
+
+def _title(fixture: dict) -> str:
+    if fixture["competition"] == "copa":
+        if fixture["stage"] == "final":
+            return "FINAL da Copa IOS"
+        return f"Copa IOS · {league.STAGE_LABELS[fixture['stage']]}"
+    if fixture["stage"] == "final":
+        return "FINAL do Pontos Corridos"
+    return f"Pontos Corridos · {fixture['stage'].capitalize()}"
+
+
+def _score(fixture: dict, names: dict) -> str:
+    home = names.get(fixture["home_user_id"], "Time")
+    away = names.get(fixture["away_user_id"], "Time")
+    if fixture["played_at"] is None:
+        return f"{home} × {away}"
+    line = f"{home} **{fixture['home_goals']} × {fixture['away_goals']}** {away}"
+    if fixture["home_penalties"] is not None:
+        line += f" (pên. {fixture['home_penalties']} × {fixture['away_penalties']})"
+    if fixture["walkover"]:
+        line += " · W.O."
+    return line
+
+
+def _matchday_rows(games: list[dict], teams: dict) -> list[dict]:
+    """Os jogos no formato de `render_matchday` (sem placar se ainda não jogaram)."""
+    rows = []
+    for game in games:
+        played = game["played_at"] is not None
+        rows.append(
+            {
+                "home": teams.get(game["home_user_id"]),
+                "away": teams.get(game["away_user_id"]),
+                "home_goals": game["home_goals"] if played else None,
+                "away_goals": game["away_goals"] if played else None,
+                "penalties": (
+                    (game["home_penalties"], game["away_penalties"])
+                    if game["home_penalties"] is not None
+                    else None
+                ),
+                "walkover": bool(game["walkover"]),
+            }
+        )
+    return rows
+
+
+async def _file(render, *args, name: str) -> discord.File:
+    image = await asyncio.to_thread(render, *args)
+    return discord.File(image, filename=name)
+
+
+class LeaguePanel(discord.ui.View):
+    """Painel do `..campeonato`: cada botão troca a página na mesma mensagem."""
+
+    PAGES = (
+        ("resumo", "Resumo", "🏠"),
+        ("tabela", "Tabela", "⚽"),
+        ("agenda", "Agenda", "📅"),
+        ("copa", "Copa IOS", "🏆"),
+        ("campeoes", "Campeões", "📜"),
+    )
+
+    def __init__(self, cog: "LeagueCog", guild_id: int, owner, page: str = "resumo"):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.owner = owner
+        self.message: discord.Message | None = None
+        for key, label, emoji in self.PAGES:
+            button = discord.ui.Button(
+                label=label,
+                emoji=emoji,
+                style=discord.ButtonStyle.primary if key == page else discord.ButtonStyle.secondary,
+                custom_id=f"campeonato:{key}",
+            )
+            button.callback = self._switch(key)
+            self.add_item(button)
+
+    def _mark(self, page: str) -> None:
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                active = item.custom_id == f"campeonato:{page}"
+                item.style = (
+                    discord.ButtonStyle.primary if active else discord.ButtonStyle.secondary
+                )
+
+    def _switch(self, page: str):
+        async def callback(interaction: discord.Interaction) -> None:
+            if interaction.user.id != self.owner.id:
+                await interaction.response.send_message(
+                    "Esse painel é de quem abriu. Use `..campeonato` para abrir o seu.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.defer()
+            embed, files = await self.cog.page(page, self.guild_id, self.owner)
+            self._mark(page)
+            await interaction.edit_original_response(embed=embed, attachments=files, view=self)
+
+        return callback
+
+    async def on_timeout(self) -> None:
+        if self.message is None:
+            return
+        for item in self.children:
+            item.disabled = True
+        try:
+            await self.message.edit(view=self)
+        except discord.HTTPException:
+            pass
+
+
+class LeagueCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.database_path = getattr(bot, "database_path", DATABASE_PATH)
+        self.locks: dict[str, asyncio.Lock] = {}
+        # Ligado por padrão: o bot principal (`memi_bot.py`) não lê `.env`, e cada servidor já
+        # precisa de `..campeonato ativar`. `MEMI_CHAMPIONSHIP_SCHEDULER=0` desliga tudo.
+        self.scheduler_enabled = os.getenv("MEMI_CHAMPIONSHIP_SCHEDULER", "1").strip() != "0"
+
+    async def cog_load(self) -> None:
+        if self.scheduler_enabled:
+            self.daily_games.start()
+
+    def cog_unload(self) -> None:
+        if self.daily_games.is_running():
+            self.daily_games.cancel()
+
+    def _settings(self, guild_id: int | str) -> dict | None:
+        with connect(self.database_path) as connection:
+            row = connection.execute(
+                "SELECT * FROM championship_settings WHERE guild_id = ?", (str(guild_id),)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def _hour(self, guild_id: int | str) -> str:
+        return hour_label((self._settings(guild_id) or {}).get("game_time"))
+
+    def _teams(self) -> dict[str, dict]:
+        return league.team_info(self.database_path)
+
+    def _names(self) -> dict[str, str]:
+        return {user: team["team_name"] for user, team in self._teams().items()}
+
+    # O dia de jogos ------------------------------------------------------------------------
+
+    async def _members_ready(self, guild: discord.Guild) -> list[str]:
+        """Quem tem time completo e está neste servidor (sem a intent de membros, pergunta um a
+        um ao Discord)."""
+        ready = await asyncio.to_thread(league.eligible_users, self.database_path)
+        members = []
+        for user_id in ready:
+            member = guild.get_member(int(user_id))
+            if member is None:
+                try:
+                    member = await guild.fetch_member(int(user_id))
+                except (discord.NotFound, discord.HTTPException):
+                    continue
+            if not member.bot:
+                members.append(user_id)
+        return members
+
+    async def run_day(self, guild: discord.Guild, send, *, manual: bool = False) -> None:
+        """Começa a edição (se for o dia) e joga tudo o que está marcado até hoje."""
+        lock = self.locks.setdefault(str(guild.id), asyncio.Lock())
+        if lock.locked():
+            if manual:
+                await send(content="Os jogos de hoje já estão rolando.")
+            return
+        async with lock:
+            edition = league.ensure_edition(guild.id, self.database_path)
+            if edition["status"] == "registration":
+                try:
+                    edition = league.start_edition(
+                        guild.id,
+                        await self._members_ready(guild),
+                        self.database_path,
+                        force=manual,
+                    )
+                except league.LeagueError as error:
+                    if manual:
+                        await send(content=str(error))
+                    else:
+                        LOGGER.info("Edição não começou no servidor %s: %s", guild.id, error)
+                    return
+                await self._announce_start(send, edition)
+            due = league.due_fixtures(edition, database_path=self.database_path)
+            if not due:
+                if manual:
+                    await send(content="Não há jogos marcados para hoje.")
+                return
+            stages = []
+            for fixture in due:
+                label = _title(fixture)
+                if label not in stages:
+                    stages.append(label)
+            await send(
+                content=f"📅 **Dia {league.day_number(edition)} da edição {edition['number']}** · "
+                + " · ".join(stages)
+            )
+            names = self._names()
+            for fixture in due:
+                await self._play_and_narrate(send, fixture, names)
+            news = await asyncio.to_thread(league.advance, edition, self.database_path)
+            await self._day_summary(send, edition, due, news)
+
+    async def _announce_start(self, send, edition: dict) -> None:
+        teams = self._teams()
+        entries = league.entries(edition["id"], self.database_path)
+        playing = [teams.get(e["discord_user_id"]) or e for e in entries if not e["waitlisted"]]
+        waiting = [teams.get(e["discord_user_id"]) or e for e in entries if e["waitlisted"]]
+        rounds = league.rounds_total(edition["id"], self.database_path)
+        calendar = (
+            f"{rounds} rodadas · final do Pontos Corridos {_date(edition, rounds + 1):%d/%m} · "
+            "Copa IOS em seguida"
+        )
+        file = await _file(
+            render_edition_start,
+            playing,
+            edition["number"],
+            calendar,
+            len(waiting),
+            name="edicao.png",
+        )
+        embed = discord.Embed(
+            title=f"🏁 Começou a edição {edition['number']}!",
+            description=INTRO.format(hour=self._hour(edition["guild_id"])),
+            color=GREEN_COLOR,
+        )
+        if waiting:
+            embed.add_field(
+                name="Lista de espera (entram primeiro na próxima)",
+                value=", ".join(team["team_name"] for team in waiting)[:1024],
+                inline=False,
+            )
+        embed.set_image(url="attachment://edicao.png")
+        await send(embed=embed, file=file)
+
+    async def _play_and_narrate(self, send, fixture: dict, names: dict) -> None:
+        home_id, away_id = fixture["home_user_id"], fixture["away_user_id"]
+        before = await asyncio.to_thread(rivalry, home_id, away_id, self.database_path)
+        played = await asyncio.to_thread(league.play_fixture, fixture, None, self.database_path)
+        title = _title(played)
+        home_team = get_team(home_id, self.database_path) or {"team_name": names.get(home_id)}
+        away_team = get_team(away_id, self.database_path) or {"team_name": names.get(away_id)}
+        home, away = home_team["team_name"], away_team["team_name"]
+        if played["walkover"]:
+            absent = {"mandante": home, "visitante": away, "ambos": f"{home} e {away}"}
+            await send(
+                content=f"🏳️ **{title}** · {_score(played, names)}\n"
+                f"{absent[played['walkover']]} sem escalação válida: W.O."
+            )
+            return
+        events = json.loads(played["events_json"] or "{}")
+        timeline = list(events.get("events", []))
+        kicks = events.get("penalty_kicks") or []
+        penalties = None
+        if kicks:
+            timeline += penalty_events(kicks, home, away)
+            penalties = (played["home_penalties"], played["away_penalties"])
+        after = await asyncio.to_thread(rivalry, home_id, away_id, self.database_path)
+        note = rivalry_line(after, home, away)
+        await send(
+            content=f"🏟️ {title} · Local: **{venue_name(home_team)}**\n"
+            f"{rivalry_intro(before, home, away)}"
+        )
+        await narrate(
+            lambda embed: send(embed=embed),
+            home,
+            away,
+            timeline,
+            title=title,
+            penalties=penalties,
+            home_color=home_team.get("color"),
+            away_color=away_team.get("color"),
+            notes=[note] if note else (),
+        )
+        if played["stage"] == "final":
+            await send(
+                file=await score_file(
+                    home_team,
+                    away_team,
+                    int(played["home_goals"]),
+                    int(played["away_goals"]),
+                    events.get("goals", []),
+                    title=title,
+                    venue=venue_name(home_team),
+                    penalties=penalties,
+                    kicks=kicks,
+                )
+            )
+
+    async def _day_summary(self, send, edition: dict, played: list[dict], news: dict) -> None:
+        """Quadro de cada competição do dia + tabela (Pontos Corridos) ou chave (Copa), e a agenda."""
+        teams = self._teams()
+        names = {user: team["team_name"] for user, team in teams.items()}
+        hour = self._hour(edition["guild_id"])
+        games = league.fixtures(edition["id"], self.database_path)
+        by_id = {game["id"]: game for game in games}
+        today = [by_id[game["id"]] for game in played]
+        day = max((g["day"] for g in today), default=league.day_number(edition))
+        upcoming = [g for g in games if g["day"] == day + 1 and g["played_at"] is None]
+        for competition in ("pintos", "copa"):
+            mine = [g for g in today if g["competition"] == competition]
+            if not mine:
+                continue
+            accent, color = (GREEN, GREEN_COLOR) if competition == "pintos" else (GOLD, GOLD_COLOR)
+            heading = _title(mine[0]).replace("Pontos Corridos · ", "").replace("Copa IOS · ", "")
+            subtitle = (
+                f"{'Pontos Corridos' if competition == 'pintos' else 'Copa IOS'} · "
+                f"Edição {edition['number']} · {_day_label(edition, day)}"
+            )
+            board = await _file(
+                render_matchday,
+                _matchday_rows(mine, teams),
+                heading.upper(),
+                subtitle,
+                accent,
+                name=f"dia-{competition}.png",
+            )
+            first = discord.Embed(title=f"📋 Resultados do dia · {heading}", color=color)
+            first.set_image(url=f"attachment://dia-{competition}.png")
+            files = [board]
+            embeds = [first]
+            if competition == "pintos" and mine[0]["stage"] != "final":
+                embed, table = await self._table_page(edition)
+                embeds.append(embed)
+                files += table
+            elif competition == "copa":
+                embed, chart = await self._cup_page(edition)
+                embeds.append(embed)
+                files += chart
+            later = [g for g in upcoming if g["competition"] == competition]
+            if later:
+                embeds[-1].add_field(
+                    name=f"📅 Amanhã ({_day_label(edition, day + 1)}), {hour}",
+                    value="\n".join(f"{_title(g)}: {_score(g, names)}" for g in later)[:1024],
+                    inline=False,
+                )
+            await send(embeds=embeds, files=files)
+        for competition in ("pintos", "copa"):
+            if news["prizes"].get(competition):
+                await self._announce_champion(send, edition, competition, news, teams)
+        if news.get("copa_draw"):
+            embed, files = await self._cup_page(edition)
+            embed.title = "🏆 Sorteio da Copa IOS"
+            first_day = min(
+                g["day"]
+                for g in league.fixtures(edition["id"], self.database_path)
+                if g["competition"] == "copa"
+            )
+            embed.description = (
+                f"Começa {_day_label(edition, first_day)}, às {hour}. Campeão e vice do Pontos Corridos "
+                "ficam em lados opostos: só podem se cruzar na final."
+            )
+            await send(embed=embed, files=files)
+        if news.get("next_edition"):
+            nxt = news["next_edition"]
+            opens = date.fromisoformat(nxt["opens_on"])
+            await send(
+                content=f"🔜 A edição {nxt['number']} começa **{opens:%d/%m} às {hour}**. Entram "
+                "todos com o time completo (11 titulares)."
+            )
+
+    async def _announce_champion(self, send, edition, competition, news, teams) -> None:
+        names = {user: team["team_name"] for user, team in teams.items()}
+        prizes = news["prizes"][competition]
+        champion = news.get(f"{competition}_champion")
+        final = next(
+            g
+            for g in league.fixtures(edition["id"], self.database_path)
+            if g["competition"] == competition and g["stage"] == "final"
+        )
+        vice = final["away_user_id"] if champion == final["home_user_id"] else final["home_user_id"]
+        line = (
+            f"Final: {names.get(final['home_user_id'], 'Time')} {final['home_goals']} × "
+            f"{final['away_goals']} {names.get(final['away_user_id'], 'Time')}"
+        )
+        if final["home_penalties"] is not None:
+            line += f" (pên. {final['home_penalties']} × {final['away_penalties']})"
+        own = next((p for p in prizes if p["user_id"] == champion), None)
+        label = "Pontos Corridos" if competition == "pintos" else "Copa IOS"
+        poster = await _file(
+            render_champion,
+            teams.get(champion) or {"team_name": "Time"},
+            label,
+            edition["number"],
+            line,
+            teams.get(vice),
+            league.prize_plain(own) if own else "",
+            name="campeao.png",
+        )
+        embed = discord.Embed(
+            title=f"🎉 {names.get(champion, 'Time')} é campeão da {label}!",
+            description="**Prêmios**\n"
+            + "\n".join(
+                f"{league.PLACE_LABELS.get(p['place'], p['place'])}: "
+                f"**{names.get(p['user_id'], 'Time')}** · {league.prize_text(p)}"
+                for p in prizes
+            ),
+            color=GOLD_COLOR,
+        )
+        embed.set_image(url="attachment://campeao.png")
+        await send(embed=embed, file=poster)
+
+    # Páginas (painel e comandos) -----------------------------------------------------------
+
+    def _shown_edition(self, guild_id: int) -> dict | None:
+        """A edição em andamento ou, entre uma e outra, a última que terminou."""
+        edition = league.current_edition(guild_id, self.database_path)
+        if edition and edition["status"] == "registration":
+            with connect(self.database_path) as connection:
+                row = connection.execute(
+                    "SELECT * FROM league_editions WHERE guild_id = ? AND number = ?",
+                    (str(guild_id), edition["number"] - 1),
+                ).fetchone()
+            return dict(row) if row else None
+        return edition
+
+    async def page(self, key: str, guild_id: int, user) -> Page:
+        if key == "campeoes":
+            return self._champions_page(guild_id)
+        if key == "resumo":
+            return self._summary_page(guild_id, user)
+        edition = self._shown_edition(guild_id)
+        if edition is None:
+            embed = discord.Embed(
+                title="🏆 Campeonatos",
+                description="Ainda não teve campeonato por aqui. A primeira edição começa às "
+                f"{self._hour(guild_id)}, quando houver pelo menos 4 times completos.",
+                color=GOLD_COLOR,
+            )
+            return embed, []
+        if key == "tabela":
+            return await self._table_page(edition, user)
+        if key == "agenda":
+            return await self._agenda_page(edition, user)
+        return await self._cup_page(edition, user)
+
+    def _summary_page(self, guild_id: int, user) -> Page:
+        edition = league.ensure_edition(guild_id, self.database_path)
+        embed = discord.Embed(
+            title=f"🏆 Campeonatos · Edição {edition['number']}",
+            description=INTRO.format(hour=self._hour(guild_id)),
+            color=GOLD_COLOR,
+        )
+        names = self._names()
+        if edition["status"] == "registration":
+            opens = date.fromisoformat(edition["opens_on"])
+            embed.add_field(
+                name="⏳ Ainda não começou",
+                value=f"Começa **{opens:%d/%m} às {self._hour(guild_id)}** (precisa de pelo menos "
+                f"{league.MIN_TEAMS} times completos).",
+                inline=False,
+            )
+            return embed, []
+        rounds = league.rounds_total(edition["id"], self.database_path)
+        table = league.standings(edition["id"], self.database_path)
+        games = league.fixtures(edition["id"], self.database_path)
+        if table:
+            leader = table[0]
+            played = max(team["played"] for team in table)
+            embed.add_field(
+                name="⚽ Pontos Corridos",
+                value=f"{played} de {rounds} rodadas · Líder: **{leader['team_name']}** "
+                f"({leader['points']} pts)",
+                inline=False,
+            )
+        copa = [g for g in games if g["competition"] == "copa"]
+        if copa:
+            last = copa[-1]
+            status = (
+                f"Campeão: **{names.get(last['winner_user_id'], 'Time')}**"
+                if last["stage"] == "final" and last["played_at"]
+                else f"Fase atual: **{league.STAGE_LABELS[last['stage']]}**"
+            )
+        else:
+            status = "Começa no dia seguinte à final do Pontos Corridos."
+        embed.add_field(name="🏆 Copa IOS", value=status, inline=False)
+        mine = [
+            g
+            for g in games
+            if g["played_at"] is None and str(user.id) in (g["home_user_id"], g["away_user_id"])
+        ]
+        if mine:
+            nxt = mine[0]
+            embed.add_field(
+                name="📅 Seu próximo jogo",
+                value=f"{_day_label(edition, nxt['day'])}, {self._hour(guild_id)} · {_title(nxt)}\n"
+                f"{_score(nxt, names)}",
+                inline=False,
+            )
+        return embed, []
+
+    def _next_game_field(self, embed, edition: dict, user, competition: str) -> None:
+        """O próximo jogo de `user` na competição, num campo do embed."""
+        if user is None:
+            return
+        games = [
+            g
+            for g in league.fixtures(edition["id"], self.database_path)
+            if g["competition"] == competition
+            and g["played_at"] is None
+            and str(user.id) in (g["home_user_id"], g["away_user_id"])
+        ]
+        if games:
+            game = games[0]
+            embed.add_field(
+                name="📅 Seu próximo jogo",
+                value=f"{_day_label(edition, game['day'])}, {self._hour(edition['guild_id'])} · "
+                f"{_title(game)}\n{_score(game, self._names())}",
+                inline=False,
+            )
+
+    async def _table_page(self, edition: dict, user=None) -> Page:
+        table = league.standings(edition["id"], self.database_path)
+        rounds = league.rounds_total(edition["id"], self.database_path)
+        played = max((team["played"] for team in table), default=0)
+        subtitle = (
+            f"Edição {edition['number']} · {played} de {rounds} rodadas · "
+            "os 2 primeiros vão à final"
+        )
+        file = await _file(
+            render_league_table, table, "PONTOS CORRIDOS", subtitle, name="tabela.png"
+        )
+        embed = discord.Embed(title="⚽ Pontos Corridos · Tabela", color=GREEN_COLOR)
+        embed.set_image(url="attachment://tabela.png")
+        self._next_game_field(embed, edition, user, "pintos")
+        return embed, [file]
+
+    async def _cup_page(self, edition: dict, user=None) -> Page:
+        rounds = league.bracket(edition["id"], self.database_path)
+        embed = discord.Embed(title=f"🏆 Copa IOS · Edição {edition['number']}", color=GOLD_COLOR)
+        self._next_game_field(embed, edition, user, "copa")
+        if not rounds:
+            embed.description = (
+                "A Copa IOS começa no dia seguinte à final do Pontos Corridos, com o campeão e o "
+                "vice em lados opostos da chave."
+            )
+            return embed, []
+        labels = {r["day"]: f"{_date(edition, r['day']):%d/%m}" for r in rounds}
+        pending = [r for r in rounds if any(g is None or not g["played_at"] for g in r["games"])]
+        subtitle = f"Edição {edition['number']} · " + (
+            f"{league.STAGE_LABELS[pending[0]['stage']]} {_day_label(edition, pending[0]['day'])}"
+            if pending
+            else "Encerrada"
+        )
+        file = await _file(
+            render_bracket, rounds, self._teams(), "COPA IOS", subtitle, labels, name="chave.png"
+        )
+        embed.set_image(url="attachment://chave.png")
+        return embed, [file]
+
+    async def _agenda_page(self, edition: dict, user) -> Page:
+        teams = self._teams()
+        names = {key: team["team_name"] for key, team in teams.items()}
+        games = [
+            g for g in league.fixtures(edition["id"], self.database_path) if g["played_at"] is None
+        ]
+        mine = [g for g in games if str(user.id) in (g["home_user_id"], g["away_user_id"])]
+        embed = discord.Embed(
+            title=f"📅 Agenda · {names.get(str(user.id), user.display_name)}",
+            description="\n".join(
+                f"**{_day_label(edition, g['day'])}** · {_title(g)}\n{_score(g, names)}"
+                for g in mine[:8]
+            )
+            or "Nenhum jogo seu marcado.",
+            color=GREEN_COLOR,
+        )
+        if not games:
+            return embed, []
+        day = games[0]["day"]
+        nxt = [g for g in games if g["day"] == day]
+        heading = _title(nxt[0]).replace("Pontos Corridos · ", "").replace("Copa IOS · ", "")
+        copa = nxt[0]["competition"] == "copa"
+        file = await _file(
+            render_matchday,
+            _matchday_rows(nxt, teams),
+            heading.upper(),
+            f"{'Copa IOS' if copa else 'Pontos Corridos'} · {_day_label(edition, day)} · "
+            f"{self._hour(edition['guild_id'])}",
+            GOLD if copa else GREEN,
+            name="agenda.png",
+        )
+        embed.add_field(name="Próximo dia de jogos", value=_day_label(edition, day), inline=False)
+        embed.set_image(url="attachment://agenda.png")
+        return embed, [file]
+
+    def _champions_page(self, guild_id: int) -> Page:
+        editions = league.history(guild_id, self.database_path)
+        lines = [
+            f"**Edição {e['number']}** · ⚽ {e.get('pintos_campeao', '—')} "
+            f"(vice {e.get('pintos_vice', '—')}) · 🏆 {e.get('copa_campeao', '—')}"
+            for e in editions[:20]
+        ]
+        embed = discord.Embed(
+            title="📜 Campeões",
+            description="\n".join(lines) or "Nenhuma edição terminou ainda.",
+            color=GOLD_COLOR,
+        )
+        return embed, []
+
+    async def _open(self, context: commands.Context, page: str) -> None:
+        if context.guild is None:
+            await context.reply("O campeonato é de cada servidor.", mention_author=False)
+            return
+        embed, files = await self.page(page, context.guild.id, context.author)
+        view = LeaguePanel(self, context.guild.id, context.author, page)
+        embed.set_footer(text="admin: ..campeonato status · jogar · adiantar · pausar · horario")
+        view.message = await context.reply(
+            embed=embed, files=files, view=view, mention_author=False
+        )
+
+    # Agendador -----------------------------------------------------------------------------
+
+    @tasks.loop(minutes=1)
+    async def daily_games(self) -> None:
+        """Cada servidor joga no seu horário, uma vez por dia, a não ser que esteja pausado.
+
+        Se o bot estava desligado no horário, os jogos saem quando ele voltar (no mesmo dia)."""
+        now = _now()
+        today = now.date().isoformat()
+        with connect(self.database_path) as connection:
+            settings = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT * FROM championship_settings
+                    WHERE enabled = 1 AND paused_on IS NULL
+                      AND (last_run_on IS NULL OR last_run_on < ?)
+                    """,
+                    (today,),
+                )
+            ]
+        for setting in settings:
+            if now.strftime("%H:%M") < (setting.get("game_time") or DEFAULT_TIME):
+                continue
+            with connect(self.database_path) as connection:
+                connection.execute(
+                    "UPDATE championship_settings SET last_run_on = ? WHERE guild_id = ?",
+                    (today, setting["guild_id"]),
+                )
+            guild = self.bot.get_guild(int(setting["guild_id"]))
+            channel = self.bot.get_channel(int(setting["channel_id"]))
+            if guild is None or not isinstance(channel, discord.TextChannel):
+                LOGGER.warning("Servidor ou canal do campeonato indisponível: %s", setting)
+                continue
+            try:
+                await self.run_day(guild, channel.send)
+            except Exception:  # um servidor com problema não pode travar os outros
+                LOGGER.exception("Falha nos jogos do servidor %s", setting["guild_id"])
+
+    @daily_games.before_loop
+    async def before_daily_games(self) -> None:
+        await self.bot.wait_until_ready()
+
+    # Comandos ------------------------------------------------------------------------------
+
+    @commands.group(name="campeonato", aliases=["campeonatos"], invoke_without_command=True)
+    async def championship(self, context: commands.Context) -> None:
+        """Painel do campeonato: resumo, tabela, agenda, Copa e campeões em botões."""
+        await self._open(context, "resumo")
+
+    @championship.command(name="tabela", aliases=["classificacao", "classificação"])
+    async def table(self, context: commands.Context) -> None:
+        await self._open(context, "tabela")
+
+    @championship.command(name="agenda", aliases=["jogos", "proximos", "próximos"])
+    async def agenda(self, context: commands.Context, member: discord.Member | None = None) -> None:
+        if context.guild is None:
+            await context.reply("O campeonato é de cada servidor.", mention_author=False)
+            return
+        target = member or context.author
+        embed, files = await self.page("agenda", context.guild.id, target)
+        view = LeaguePanel(self, context.guild.id, context.author, "agenda")
+        view.message = await context.reply(
+            embed=embed, files=files, view=view, mention_author=False
+        )
+
+    @championship.command(name="copa", aliases=["chave", "ios"])
+    async def cup(self, context: commands.Context) -> None:
+        await self._open(context, "copa")
+
+    @championship.command(name="historico", aliases=["histórico", "campeoes", "campeões"])
+    async def past(self, context: commands.Context) -> None:
+        await self._open(context, "campeoes")
+
+    def _is_admin(self, context: commands.Context) -> bool:
+        """Admin do bot (`src.admins`) ou quem tem Gerenciar servidor."""
+        if context.guild is None:
+            return False
+        return is_admin(context.author.id) or context.author.guild_permissions.manage_guild
+
+    @championship.command(name="canal")
+    async def channel(
+        self, context: commands.Context, channel: discord.TextChannel | None = None
+    ) -> None:
+        if not self._is_admin(context):
+            await context.reply(
+                "É preciso ser admin do bot ou ter a permissão Gerenciar servidor.",
+                mention_author=False,
+            )
+            return
+        target = channel or context.channel
+        if not isinstance(target, discord.TextChannel):
+            await context.reply("Use um canal de texto do servidor.", mention_author=False)
+            return
+        with connect(self.database_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO championship_settings (guild_id, channel_id, enabled)
+                VALUES (?, ?, 0)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    channel_id = excluded.channel_id, updated_at = CURRENT_TIMESTAMP
+                """,
+                (str(context.guild.id), str(target.id)),
+            )
+        await context.reply(
+            f"Canal do campeonato: {target.mention}. Ative os jogos diários com "
+            "`..campeonato ativar`.",
+            mention_author=False,
+        )
+
+    @championship.command(name="ativar")
+    async def enable(self, context: commands.Context) -> None:
+        if not self._is_admin(context):
+            await context.reply(
+                "É preciso ser admin do bot ou ter a permissão Gerenciar servidor.",
+                mention_author=False,
+            )
+            return
+        if not self.scheduler_enabled:
+            await context.reply(
+                "O agendador foi desligado com `MEMI_CHAMPIONSHIP_SCHEDULER=0`. Tire essa "
+                "variável (ou troque para 1) e reinicie o bot.",
+                mention_author=False,
+            )
+            return
+        with connect(self.database_path) as connection:
+            cursor = connection.execute(
+                "UPDATE championship_settings SET enabled = 1, updated_at = CURRENT_TIMESTAMP "
+                "WHERE guild_id = ?",
+                (str(context.guild.id),),
+            )
+        if not cursor.rowcount:
+            await context.reply(
+                "Configure antes o canal com `..campeonato canal`.", mention_author=False
+            )
+            return
+        league.ensure_edition(context.guild.id, self.database_path)
+        await context.reply(
+            f"Jogos diários ativados: todo dia às {self._hour(context.guild.id)} (Brasília).",
+            mention_author=False,
+        )
+
+    @championship.command(name="jogar", aliases=["iniciar"])
+    async def play_now(self, context: commands.Context) -> None:
+        """Admin: começa a edição agora (se estiver esperando) e joga os jogos de hoje."""
+        if not self._is_admin(context):
+            await context.reply(
+                "É preciso ser admin do bot ou ter a permissão Gerenciar servidor.",
+                mention_author=False,
+            )
+            return
+        await self.run_day(context.guild, lambda **kwargs: context.send(**kwargs), manual=True)
+
+    @championship.command(name="adiantar", aliases=["proxima", "próxima", "pular", "avancar"])
+    async def pull_forward(self, context: commands.Context) -> None:
+        """Admin: joga agora a próxima rodada (ou fase da Copa) e adianta o calendário."""
+        if not self._is_admin(context):
+            await context.reply(
+                "É preciso ser admin do bot ou ter a permissão Gerenciar servidor.",
+                mention_author=False,
+            )
+            return
+        edition = league.ensure_edition(context.guild.id, self.database_path)
+        if edition["status"] == "playing":
+            league.pull_forward(edition, self.database_path)
+        await self.run_day(context.guild, lambda **kwargs: context.send(**kwargs), manual=True)
+
+    async def _admin_only(self, context: commands.Context) -> bool:
+        if self._is_admin(context):
+            return True
+        await context.reply(
+            "É preciso ser admin do bot ou ter a permissão Gerenciar servidor.",
+            mention_author=False,
+        )
+        return False
+
+    @championship.command(name="pausar", aliases=["pause"])
+    async def pause(self, context: commands.Context) -> None:
+        """Admin: para os jogos diários até `..campeonato retomar` (a edição fica guardada)."""
+        if not await self._admin_only(context):
+            return
+        settings = self._settings(context.guild.id)
+        if settings is None:
+            await context.reply(
+                "Configure antes o canal com `..campeonato canal`.", mention_author=False
+            )
+            return
+        if settings.get("paused_on"):
+            await context.reply("O campeonato já está pausado.", mention_author=False)
+            return
+        with connect(self.database_path) as connection:
+            connection.execute(
+                "UPDATE championship_settings SET paused_on = ? WHERE guild_id = ?",
+                (league.today().isoformat(), str(context.guild.id)),
+            )
+        await context.reply(
+            "⏸️ Campeonato pausado. Nenhum jogo acontece até `..campeonato retomar`; o "
+            "calendário anda junto, sem jogos acumulados.",
+            mention_author=False,
+        )
+
+    @championship.command(name="retomar", aliases=["despausar", "resume"])
+    async def resume(self, context: commands.Context) -> None:
+        if not await self._admin_only(context):
+            return
+        settings = self._settings(context.guild.id)
+        if not settings or not settings.get("paused_on"):
+            await context.reply("O campeonato não está pausado.", mention_author=False)
+            return
+        paused = (league.today() - date.fromisoformat(settings["paused_on"])).days
+        edition = league.current_edition(context.guild.id, self.database_path)
+        if edition and edition["status"] == "playing" and paused:
+            league.shift_calendar(edition, paused, self.database_path)
+        with connect(self.database_path) as connection:
+            connection.execute(
+                "UPDATE championship_settings SET paused_on = NULL WHERE guild_id = ?",
+                (str(context.guild.id),),
+            )
+        extra = f" O calendário andou {paused} dia(s)." if paused else ""
+        await context.reply(
+            f"▶️ Campeonato retomado: os jogos voltam às {self._hour(context.guild.id)}.{extra}",
+            mention_author=False,
+        )
+
+    @championship.command(name="horario", aliases=["horário", "hora"])
+    async def set_time(self, context: commands.Context, value: str | None = None) -> None:
+        """Admin: muda o horário dos jogos do servidor (Brasília), ex.: `21:00`."""
+        if not await self._admin_only(context):
+            return
+        chosen = parse_time(value or "")
+        if chosen is None:
+            await context.reply(
+                f"Use o horário de Brasília, ex.: `..campeonato horario 21:00`. Agora é "
+                f"**{self._hour(context.guild.id)}**.",
+                mention_author=False,
+            )
+            return
+        with connect(self.database_path) as connection:
+            cursor = connection.execute(
+                "UPDATE championship_settings SET game_time = ? WHERE guild_id = ?",
+                (chosen, str(context.guild.id)),
+            )
+        if not cursor.rowcount:
+            await context.reply(
+                "Configure antes o canal com `..campeonato canal`.", mention_author=False
+            )
+            return
+        await context.reply(
+            f"🕘 Os jogos passam a ser às **{hour_label(chosen)}** (Brasília).",
+            mention_author=False,
+        )
+
+    @championship.command(name="status", aliases=["diagnostico", "diagnóstico"])
+    async def status(self, context: commands.Context) -> None:
+        """Admin: tudo o que decide se os jogos saem, numa mensagem só."""
+        if not await self._admin_only(context):
+            return
+        guild_id = context.guild.id
+        settings = self._settings(guild_id) or {}
+        names = self._names()
+        lines = [
+            f"Agendador do bot: **{'ligado' if self.scheduler_enabled else 'desligado'}**",
+            "Canal: "
+            + (
+                f"<#{settings['channel_id']}>"
+                if settings.get("channel_id")
+                else "**não configurado**"
+            ),
+            f"Ativado no servidor: **{'sim' if settings.get('enabled') else 'não'}**",
+            f"Horário: **{hour_label(settings.get('game_time'))}** (Brasília)",
+            "Pausado: "
+            + (f"**sim**, desde {settings['paused_on']}" if settings.get("paused_on") else "não"),
+            f"Última rodada automática: {settings.get('last_run_on') or '—'}",
+        ]
+        edition = league.current_edition(guild_id, self.database_path)
+        if edition:
+            lines.append("")
+            status = {"registration": "esperando para começar", "playing": "em andamento"}.get(
+                edition["status"], "encerrada"
+            )
+            lines.append(f"Edição **{edition['number']}**: {status}")
+            if edition["status"] == "registration":
+                ready = await self._members_ready(context.guild)
+                lines.append(
+                    f"Começa {date.fromisoformat(edition['opens_on']):%d/%m} · times completos "
+                    f"no servidor: **{len(ready)}** (mínimo {league.MIN_TEAMS})"
+                )
+            elif edition["status"] == "playing":
+                due = league.due_fixtures(edition, database_path=self.database_path)
+                pending = [
+                    g
+                    for g in league.fixtures(edition["id"], self.database_path)
+                    if not g["played_at"]
+                ]
+                lines.append(
+                    f"Dia {league.day_number(edition)} · jogos pendentes hoje: **{len(due)}** · "
+                    f"faltam no total: **{len(pending)}**"
+                )
+                problems = league.lineup_problems(edition, self.database_path)
+                if problems:
+                    lines.append(
+                        "⚠️ Perderiam por W.O.: "
+                        + ", ".join(names.get(user, user) for user in problems)
+                    )
+        embed = discord.Embed(
+            title="🛠️ Campeonato · status", description="\n".join(lines), color=GOLD_COLOR
+        )
+        await context.reply(embed=embed, mention_author=False)
+
+    @championship.command(name="remover", aliases=["tirar", "expulsar"])
+    async def remove(self, context: commands.Context, member: discord.Member) -> None:
+        """Admin: tira um time da edição; os jogos que faltam dele viram W.O."""
+        if not await self._admin_only(context):
+            return
+        edition = league.current_edition(context.guild.id, self.database_path)
+        if not edition or edition["status"] != "playing":
+            await context.reply("Não há edição em andamento.", mention_author=False)
+            return
+        try:
+            pending = league.remove_team(edition, member.id, self.database_path)
+        except league.LeagueError as error:
+            await context.reply(str(error), mention_author=False)
+            return
+        await context.reply(
+            f"🚫 {member.mention} saiu da edição {edition['number']}. Os {pending} jogo(s) que "
+            "faltavam viram W.O. (3 × 0 para o adversário).",
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @championship.command(name="cancelar")
+    async def cancel(self, context: commands.Context, confirm: str | None = None) -> None:
+        """Admin: encerra a edição sem prêmios e abre a próxima (precisa de `confirmar`)."""
+        if not await self._admin_only(context):
+            return
+        edition = league.current_edition(context.guild.id, self.database_path)
+        if not edition or edition["status"] == "completed":
+            await context.reply("Não há edição para cancelar.", mention_author=False)
+            return
+        if (confirm or "").casefold() != "confirmar":
+            await context.reply(
+                f"Isso encerra a edição {edition['number']} **sem prêmios** e abre a próxima. "
+                "Para seguir, use `..campeonato cancelar confirmar`.",
+                mention_author=False,
+            )
+            return
+        nxt = league.cancel_edition(edition, self.database_path)
+        await context.reply(
+            f"🗑️ Edição {edition['number']} cancelada. A edição {nxt['number']} já pode começar: "
+            f"às {self._hour(context.guild.id)} ou na hora com `..campeonato jogar`.",
+            mention_author=False,
+        )
+
+    # `..pontos` e `..copa` -------------------------------------------------------------
+
+    def _playing_edition(self, guild_id: int) -> dict | None:
+        edition = league.current_edition(guild_id, self.database_path)
+        return edition if edition and edition["status"] == "playing" else None
+
+    async def _advance_competition(self, context: commands.Context, competition: str) -> None:
+        """Joga já o próximo dia da competição e adianta o calendário."""
+        if not await self._admin_only(context):
+            return
+        edition = self._playing_edition(context.guild.id)
+        if edition is None:
+            await context.reply("Não há edição em andamento.", mention_author=False)
+            return
+        try:
+            league.pull_forward(edition, self.database_path, competition=competition)
+        except league.LeagueError as error:
+            await context.reply(str(error), mention_author=False)
+            return
+        await self.run_day(context.guild, lambda **kwargs: context.send(**kwargs), manual=True)
+
+    async def _replay(self, context: commands.Context, member: discord.Member) -> None:
+        """Refaz o jogo de hoje da pessoa (narrado de novo) e atualiza tabela ou chave."""
+        if not await self._admin_only(context):
+            return
+        edition = self._playing_edition(context.guild.id)
+        if edition is None:
+            await context.reply("Não há edição em andamento.", mention_author=False)
+            return
+        lock = self.locks.setdefault(str(context.guild.id), asyncio.Lock())
+        if lock.locked():
+            await context.reply("Espere os jogos de agora terminarem.", mention_author=False)
+            return
+        async with lock:
+            try:
+                game = league.replayable(edition, member.id, self.database_path)
+            except league.LeagueError as error:
+                await context.reply(str(error), mention_author=False)
+                return
+            names = self._names()
+            await context.reply(
+                f"🔁 Refazendo {_title(game)}: {_score(game, names)}.", mention_author=False
+            )
+            fresh = await asyncio.to_thread(league.reset_fixture, game, self.database_path)
+            send = lambda **kwargs: context.send(**kwargs)  # noqa: E731
+            await self._play_and_narrate(send, fresh, names)
+            replayed = next(
+                g
+                for g in league.fixtures(edition["id"], self.database_path)
+                if g["id"] == game["id"]
+            )
+            if replayed["competition"] == "copa":
+                league.sync_copa_winner(replayed, self.database_path)
+                embed, files = await self._cup_page(edition)
+            else:
+                embed, files = await self._table_page(edition)
+            await context.send(embed=embed, files=files)
+
+    @commands.group(name="pontos", aliases=["pontoscorridos"], invoke_without_command=True)
+    async def pintos(self, context: commands.Context) -> None:
+        """Pontos Corridos: tabela, seu próximo jogo e o painel do campeonato."""
+        await self._open(context, "tabela")
+
+    @pintos.command(name="rodada", aliases=["jogos", "resultados"])
+    async def pintos_round(self, context: commands.Context, number: int | None = None) -> None:
+        """Os jogos de uma rodada (sem número: a última jogada)."""
+        if context.guild is None:
+            await context.reply("O campeonato é de cada servidor.", mention_author=False)
+            return
+        edition = self._shown_edition(context.guild.id)
+        if edition is None:
+            await context.reply("Ainda não teve campeonato por aqui.", mention_author=False)
+            return
+        rounds = league.rounds_total(edition["id"], self.database_path)
+        chosen = number or max(1, league.current_round(edition["id"], self.database_path))
+        games = league.round_games(edition["id"], chosen, self.database_path)
+        if not games:
+            await context.reply(
+                f"Essa edição tem {rounds} rodadas (e a final, que é a {rounds + 1}).",
+                mention_author=False,
+            )
+            return
+        heading = "FINAL" if games[0]["stage"] == "final" else f"RODADA {chosen}"
+        played = all(g["played_at"] for g in games)
+        when = _day_label(edition, games[0]["day"])
+        subtitle = f"Pontos Corridos · Edição {edition['number']} · {when}" + (
+            "" if played else f" · {self._hour(context.guild.id)}"
+        )
+        file = await _file(
+            render_matchday,
+            _matchday_rows(games, self._teams()),
+            heading,
+            subtitle,
+            GREEN,
+            name="rodada.png",
+        )
+        embed = discord.Embed(
+            title=f"⚽ Pontos Corridos · {heading.capitalize()}"
+            + ("" if played else " (ainda não jogada)"),
+            color=GREEN_COLOR,
+        )
+        embed.set_image(url="attachment://rodada.png")
+        embed.set_footer(text=f"..pontos rodada <1 a {rounds + 1}>")
+        await context.reply(embed=embed, file=file, mention_author=False)
+
+    @pintos.command(name="adiantar", aliases=["proxima", "próxima"])
+    async def pintos_advance(self, context: commands.Context) -> None:
+        """Admin: joga já a próxima rodada do Pontos Corridos."""
+        await self._advance_competition(context, "pintos")
+
+    @pintos.command(name="encerrar", aliases=["terminar", "finalizar"])
+    async def pintos_end(self, context: commands.Context, confirm: str | None = None) -> None:
+        """Admin: acaba os pontos corridos agora e marca a final dos 2 primeiros."""
+        if not await self._admin_only(context):
+            return
+        edition = self._playing_edition(context.guild.id)
+        if edition is None:
+            await context.reply("Não há edição em andamento.", mention_author=False)
+            return
+        if (confirm or "").casefold() != "confirmar":
+            await context.reply(
+                "Isso apaga as rodadas que faltam do Pontos Corridos (a tabela fica como está) e marca a "
+                "final entre os 2 primeiros. Para seguir: `..pontos encerrar confirmar`.",
+                mention_author=False,
+            )
+            return
+        try:
+            final = league.end_pintos(edition, self.database_path)
+        except league.LeagueError as error:
+            await context.reply(str(error), mention_author=False)
+            return
+        names = self._names()
+        await context.reply(
+            f"🏁 Pontos corridos encerrados. Final: **{_score(final, names)}**, "
+            f"{_day_label(edition, final['day'])} às {self._hour(context.guild.id)} "
+            "(ou agora, com `..pontos adiantar`).",
+            mention_author=False,
+        )
+
+    @pintos.command(name="refazer", aliases=["rejogar", "replay"])
+    async def pintos_replay(self, context: commands.Context, member: discord.Member) -> None:
+        """Admin: refaz o jogo de hoje da pessoa (só jogos do dia; final não)."""
+        await self._replay(context, member)
+
+    @commands.group(name="copa", aliases=["copaios"], invoke_without_command=True)
+    async def copa(self, context: commands.Context) -> None:
+        """Copa IOS: chave, fase atual e seu próximo jogo."""
+        await self._open(context, "copa")
+
+    @copa.command(name="adiantar", aliases=["proxima", "próxima"])
+    async def copa_advance(self, context: commands.Context) -> None:
+        """Admin: joga já a próxima fase da Copa."""
+        await self._advance_competition(context, "copa")
+
+    @copa.command(name="sortear", aliases=["resortear", "sorteio"])
+    async def copa_redraw(self, context: commands.Context) -> None:
+        """Admin: sorteia a chave de novo (antes da primeira fase ser jogada)."""
+        if not await self._admin_only(context):
+            return
+        edition = self._playing_edition(context.guild.id)
+        if edition is None:
+            await context.reply("Não há edição em andamento.", mention_author=False)
+            return
+        try:
+            league.redraw_copa(edition, self.database_path)
+        except league.LeagueError as error:
+            await context.reply(str(error), mention_author=False)
+            return
+        embed, files = await self._cup_page(edition)
+        embed.title = "🎲 Copa IOS · novo sorteio"
+        await context.reply(embed=embed, files=files, mention_author=False)
+
+    @copa.command(name="wo", aliases=["w.o.", "walkover"])
+    async def copa_walkover(self, context: commands.Context, member: discord.Member) -> None:
+        """Admin: W.O. no próximo jogo da Copa da pessoa (o adversário passa)."""
+        if not await self._admin_only(context):
+            return
+        edition = self._playing_edition(context.guild.id)
+        if edition is None:
+            await context.reply("Não há edição em andamento.", mention_author=False)
+            return
+        try:
+            game = league.copa_walkover(edition, member.id, self.database_path)
+        except league.LeagueError as error:
+            await context.reply(str(error), mention_author=False)
+            return
+        news = await asyncio.to_thread(league.advance, edition, self.database_path)
+        names = self._names()
+        await context.reply(
+            f"🏳️ W.O. na {_title(game)}: {_score(game, names)}. "
+            f"**{names.get(game['winner_user_id'], 'Time')}** avança.",
+            mention_author=False,
+        )
+        send = lambda **kwargs: context.send(**kwargs)  # noqa: E731
+        if news["prizes"].get("copa"):
+            await self._announce_champion(send, edition, "copa", news, self._teams())
+        else:
+            embed, files = await self._cup_page(edition)
+            await context.send(embed=embed, files=files)
+        if news.get("next_edition"):
+            nxt = news["next_edition"]
+            await context.send(
+                f"🔜 A edição {nxt['number']} começa "
+                f"**{date.fromisoformat(nxt['opens_on']):%d/%m} às {self._hour(context.guild.id)}**."
+            )
+
+    @copa.command(name="refazer", aliases=["rejogar", "replay"])
+    async def copa_replay(self, context: commands.Context, member: discord.Member) -> None:
+        """Admin: refaz o jogo de hoje da pessoa na Copa (se a fase seguinte não começou)."""
+        await self._replay(context, member)
+
+    @commands.command(name="temporada", aliases=["season", "tabela"])
+    async def season(self, context: commands.Context) -> None:
+        await self._open(context, "tabela")
+
+    @commands.command(name="temporadas", aliases=["seasons", "campeoes", "campeões"])
+    async def seasons(self, context: commands.Context) -> None:
+        await self._open(context, "campeoes")
+
+
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(LeagueCog(bot))

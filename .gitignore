@@ -1,0 +1,48 @@
+# Segredos
+.env
+.env.*
+!.env.example
+token.txt
+*.key
+*.pem
+
+# Banco de dados, backups e dados locais (dados de jogadores do servidor)
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+data/
+backups/
+*.bak
+*.dump
+
+# Fotos (distribuídas nos Releases) e cartas personalizadas do Cartola (nunca publicadas)
+data/photos/
+data/assets/
+
+# Logs
+*.log
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
+
+# Editores e sistema
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+tmp*/
